@@ -1,0 +1,883 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#0f172a">
+    <title>YouTube Quiz Generator</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        :root {
+            --bg: #0f172a;
+            --card: #1e293b;
+            --border: #334155;
+            --text: #e2e8f0;
+            --text-dim: #94a3b8;
+            --primary: #6366f1;
+            --primary-hover: #818cf8;
+            --success: #22c55e;
+            --error: #ef4444;
+            --warning: #f59e0b;
+            --touch-min: 44px;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .container {
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 2rem 1rem;
+        }
+
+        /* Header */
+        .header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .header h1 {
+            font-size: 1.75rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .header p {
+            color: var(--text-dim);
+            font-size: 0.9rem;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        /* Input */
+        .input-group {
+            margin-bottom: 1rem;
+        }
+
+        .input-group label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-dim);
+            margin-bottom: 0.4rem;
+            font-weight: 500;
+        }
+
+        .input-group input,
+        .input-group select {
+            width: 100%;
+            padding: 0.75rem 0.85rem;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 1rem; /* 16px prevents iOS zoom */
+            outline: none;
+            transition: border-color 0.2s;
+            min-height: var(--touch-min);
+        }
+
+        .input-group input:focus,
+        .input-group select:focus {
+            border-color: var(--primary);
+        }
+
+        /* Button */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            padding: 0.85rem 1.5rem;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+            width: 100%;
+            min-height: var(--touch-min);
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .btn:hover { background: var(--primary-hover); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .btn-outline {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+        .btn-outline:hover { background: var(--card); }
+
+        /* Loading */
+        .spinner {
+            display: inline-block;
+            width: 20px; height: 20px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .loading-text {
+            text-align: center;
+            padding: 2rem 1rem;
+            color: var(--text-dim);
+        }
+
+        .loading-text .spinner {
+            width: 32px; height: 32px;
+            border-width: 3px;
+            margin-bottom: 1rem;
+            display: block;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        /* Progress bar */
+        .progress-container {
+            margin-top: 1rem;
+            background: var(--bg);
+            border-radius: 8px;
+            overflow: hidden;
+            height: 8px;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: var(--primary);
+            border-radius: 8px;
+            transition: width 0.5s ease;
+            width: 0%;
+        }
+
+        .progress-steps {
+            margin-top: 0.75rem;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            text-align: left;
+        }
+
+        .progress-step {
+            padding: 0.3rem 0;
+            opacity: 0.5;
+            transition: opacity 0.3s;
+        }
+
+        .progress-step.active {
+            opacity: 1;
+            color: var(--text);
+        }
+
+        .progress-step.done {
+            opacity: 0.7;
+            color: var(--success);
+        }
+
+        .progress-step.done::before {
+            content: '\2713 ';
+        }
+
+        .progress-step.active::before {
+            content: '\25B6 ';
+        }
+
+        /* Quiz */
+        .quiz-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+        }
+
+        .question {
+            margin-bottom: 1.5rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .question:last-child { border-bottom: none; }
+
+        .question-number {
+            font-size: 0.8rem;
+            color: var(--primary);
+            font-weight: 600;
+            margin-bottom: 0.3rem;
+        }
+
+        .question-text {
+            font-size: 1rem;
+            line-height: 1.5;
+            margin-bottom: 0.75rem;
+        }
+
+        .options { list-style: none; }
+
+        .option {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.5rem;
+            padding: 0.75rem 0.85rem;
+            margin-bottom: 0.5rem;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.9rem;
+            line-height: 1.4;
+            min-height: var(--touch-min);
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .option:hover { border-color: var(--primary); }
+        .option.selected { border-color: var(--primary); background: rgba(99, 102, 241, 0.15); }
+
+        .option input[type="radio"] {
+            margin-top: 0.15rem;
+            accent-color: var(--primary);
+            min-width: 18px;
+            min-height: 18px;
+        }
+
+        .option label {
+            cursor: pointer;
+            flex: 1;
+        }
+
+        /* Results */
+        .option.correct { border-color: var(--success); background: rgba(34, 197, 94, 0.1); }
+        .option.wrong { border-color: var(--error); background: rgba(239, 68, 68, 0.1); }
+        .option.correct.wrong { border-color: var(--error); }
+
+        .explanation {
+            margin-top: 0.5rem;
+            padding: 0.75rem;
+            background: rgba(99, 102, 241, 0.08);
+            border-radius: 6px;
+            font-size: 0.85rem;
+            color: var(--text-dim);
+            line-height: 1.5;
+        }
+
+        .result-icon { font-size: 1.2rem; margin-right: 0.25rem; }
+
+        /* Score */
+        .score-card {
+            text-align: center;
+            padding: 2rem;
+        }
+
+        .score-big { font-size: 3rem; font-weight: 700; }
+        .score-total { font-size: 1rem; color: var(--text-dim); }
+
+        .badge {
+            display: inline-block;
+            padding: 0.3rem 0.8rem;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-top: 0.5rem;
+        }
+
+        .badge-success { background: rgba(34, 197, 94, 0.2); color: var(--success); }
+        .badge-warning { background: rgba(245, 158, 11, 0.2); color: var(--warning); }
+        .badge-error { background: rgba(239, 68, 68, 0.2); color: var(--error); }
+
+        /* Languages */
+        .lang-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.4rem;
+            margin-top: 0.5rem;
+        }
+
+        .lang-chip {
+            font-size: 0.75rem;
+            padding: 0.2rem 0.5rem;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-dim);
+        }
+
+        .lang-chip.auto { border-color: var(--primary); color: var(--primary); }
+
+        /* Hidden */
+        .hidden { display: none !important; }
+
+        /* Error */
+        .error-msg {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid var(--error);
+            border-radius: 8px;
+            padding: 1rem;
+            color: var(--error);
+            margin-bottom: 1rem;
+        }
+
+        /* PDF Buttons */
+        .pdf-buttons {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            margin-top: 0.75rem;
+        }
+
+        .btn-pdf {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.55rem 1rem;
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-dim);
+            font-size: 0.8rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+            min-height: var(--touch-min);
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .btn-pdf:hover {
+            border-color: var(--primary);
+            color: var(--text);
+            background: rgba(99, 102, 241, 0.08);
+        }
+
+        .btn-pdf svg {
+            width: 14px;
+            height: 14px;
+            fill: currentColor;
+        }
+
+        /* ============ MOBILE RESPONSIVE ============ */
+        @media (max-width: 640px) {
+            .container {
+                padding: 1rem 0.75rem;
+            }
+
+            .header h1 {
+                font-size: 1.4rem;
+            }
+
+            .header p {
+                font-size: 0.85rem;
+            }
+
+            .card {
+                padding: 1rem;
+                border-radius: 10px;
+                margin-bottom: 0.75rem;
+            }
+
+            .input-group input,
+            .input-group select {
+                padding: 0.8rem 0.75rem;
+                font-size: 16px; /* Prevents iOS auto-zoom */
+            }
+
+            .btn {
+                padding: 0.9rem 1rem;
+                font-size: 1rem;
+            }
+
+            .question-text {
+                font-size: 0.95rem;
+            }
+
+            .option {
+                padding: 0.7rem 0.75rem;
+                font-size: 0.9rem;
+            }
+
+            .score-big {
+                font-size: 2.5rem;
+            }
+
+            .score-card {
+                padding: 1.5rem 1rem;
+            }
+
+            .pdf-buttons {
+                flex-direction: column;
+                gap: 0.4rem;
+            }
+
+            .btn-pdf {
+                width: 100%;
+                justify-content: center;
+                padding: 0.65rem 1rem;
+            }
+
+            .quiz-title {
+                font-size: 1.1rem;
+            }
+
+            .explanation {
+                font-size: 0.8rem;
+                padding: 0.6rem;
+            }
+
+            .progress-container {
+                height: 6px;
+            }
+
+            .loading-text {
+                padding: 1.5rem 0.5rem;
+            }
+        }
+
+        @media (max-width: 380px) {
+            .container {
+                padding: 0.75rem 0.5rem;
+            }
+
+            .header h1 {
+                font-size: 1.25rem;
+            }
+
+            .card {
+                padding: 0.75rem;
+                border-radius: 8px;
+            }
+
+            .question-text {
+                font-size: 0.9rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>YouTube Quiz Generator</h1>
+            <p>Paste a YouTube link, get UPSC-style quiz questions</p>
+        </div>
+
+        <!-- Input Section -->
+        <div id="input-section">
+            <div class="card">
+                <div class="input-group">
+                    <label for="youtube-url">YouTube Video URL</label>
+                    <input type="url" id="youtube-url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="url" autofocus>
+                </div>
+                <div class="input-group">
+                    <label for="num-questions">Number of Questions (1-30)</label>
+                    <input type="number" id="num-questions" value="10" min="1" max="30">
+                </div>
+                <div class="input-group">
+                    <label for="difficulty">Difficulty</label>
+                    <select id="difficulty">
+                        <option value="easy">Easy</option>
+                        <option value="moderate" selected>Moderate</option>
+                        <option value="hard">Hard</option>
+                    </select>
+                </div>
+                <button class="btn" id="generate-btn" onclick="generateQuiz()">
+                    Generate Quiz
+                </button>
+            </div>
+        </div>
+
+        <!-- Error -->
+        <div id="error-section" class="hidden">
+            <div class="error-msg" id="error-msg"></div>
+            <button class="btn btn-outline" onclick="goBack()">Try Again</button>
+        </div>
+
+        <!-- Loading with progress -->
+        <div id="loading-section" class="hidden">
+            <div class="card">
+                <div class="loading-text">
+                    <div class="spinner"></div>
+                    <div id="loading-msg">Starting...</div>
+                    <div class="progress-container">
+                        <div class="progress-bar" id="progress-bar"></div>
+                    </div>
+                    <div class="progress-steps" id="progress-steps"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Quiz Section -->
+        <div id="quiz-section" class="hidden">
+            <div class="card">
+                <div class="quiz-title" id="quiz-title"></div>
+                <div class="lang-chips" id="quiz-meta"></div>
+                <div class="pdf-buttons" id="quiz-pdf-buttons"></div>
+            </div>
+            <form id="quiz-form">
+                <div id="questions-container"></div>
+                <div class="card">
+                    <button type="submit" class="btn" id="submit-btn">Submit Answers</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- Results Section -->
+        <div id="results-section" class="hidden">
+            <div class="card score-card">
+                <div class="score-big" id="score-display">0%</div>
+                <div class="score-total" id="score-text">0 out of 0</div>
+                <div id="score-badge"></div>
+                <div class="pdf-buttons" id="results-pdf-buttons"></div>
+            </div>
+            <div id="results-container"></div>
+            <div class="card">
+                <button class="btn btn-outline" onclick="goBack()">Generate Another Quiz</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API = window.location.origin;
+        let currentQuiz = null;
+
+        // ---- Generate Quiz (SSE streaming with fallback) ----
+        async function generateQuiz() {
+            const url = document.getElementById('youtube-url').value.trim();
+            if (!url) { alert('Please enter a YouTube URL'); return; }
+
+            const numQ = parseInt(document.getElementById('num-questions').value) || 10;
+            const diff = document.getElementById('difficulty').value;
+
+            // Disable button
+            const btn = document.getElementById('generate-btn');
+            btn.disabled = true;
+
+            showSection('loading');
+            setProgress(0, 'Starting...');
+            clearProgressSteps();
+
+            let streamSucceeded = false;
+
+            try {
+                // Use SSE streaming endpoint
+                const params = new URLSearchParams({
+                    youtube_url: url,
+                    num_questions: numQ,
+                    difficulty: diff
+                });
+
+                const evtSource = new EventSource(`${API}/api/quiz/generate/stream?${params}`);
+
+                evtSource.addEventListener('progress', (e) => {
+                    streamSucceeded = true;  // at least one progress event received
+                    const data = JSON.parse(e.data);
+                    onProgress(data);
+                });
+
+                evtSource.addEventListener('complete', (e) => {
+                    evtSource.close();
+                    const data = JSON.parse(e.data);
+                    currentQuiz = data;
+                    setProgress(100, 'Quiz ready!');
+                    btn.disabled = false;
+                    renderQuiz(currentQuiz);
+                });
+
+                evtSource.addEventListener('error', (e) => {
+                    evtSource.close();
+
+                    // If we already got some progress, it's a real failure
+                    if (streamSucceeded) {
+                        btn.disabled = false;
+                        showError('Quiz generation failed. Please try again.');
+                        return;
+                    }
+
+                    // If no progress events at all, fallback to POST endpoint
+                    console.warn('SSE stream failed, falling back to POST endpoint');
+                    generateQuizFallback(url, numQ, diff, btn);
+                });
+
+            } catch (e) {
+                // EventSource constructor itself failed — fallback
+                console.warn('EventSource not available, falling back to POST endpoint');
+                generateQuizFallback(url, numQ, diff, btn);
+            }
+        }
+
+        // Fallback: non-streaming POST endpoint
+        async function generateQuizFallback(url, numQ, diff, btn) {
+            setProgress(0, 'Generating quiz (this may take 30-60 seconds)...');
+            clearProgressSteps();
+            addProgressStep('Generating quiz...', 'active');
+
+            try {
+                const res = await fetch(`${API}/api/quiz/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ youtube_url: url, num_questions: numQ, difficulty: diff })
+                });
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || `Error ${res.status}`);
+                }
+
+                currentQuiz = await res.json();
+                setProgress(100, 'Quiz ready!');
+                btn.disabled = false;
+                renderQuiz(currentQuiz);
+            } catch (e) {
+                btn.disabled = false;
+                showError(e.message);
+            }
+        }
+
+        function onProgress(data) {
+            const { step, message, batch, total_batches, done, total } = data;
+
+            switch (step) {
+                case 'cache':
+                    setProgress(90, message);
+                    addProgressStep(message, 'done');
+                    break;
+                case 'transcript':
+                    setProgress(10, message);
+                    addProgressStep('Fetching transcript...', 'active');
+                    break;
+                case 'transcript_done':
+                    setProgress(25, message);
+                    markStepDone('Fetching transcript...');
+                    addProgressStep(message, 'done');
+                    addProgressStep('Generating questions...', 'active');
+                    break;
+                case 'generating':
+                    if (total_batches) {
+                        const pct = 25 + Math.round((batch / total_batches) * 65);
+                        setProgress(pct, message);
+                    } else {
+                        setProgress(50, message);
+                    }
+                    addProgressStep(message, 'active');
+                    break;
+                case 'batch_done':
+                    if (total) {
+                        const pct = 25 + Math.round((done / total) * 65);
+                        setProgress(pct, message);
+                    }
+                    markStepDone('Generating questions...');
+                    addProgressStep(message, 'done');
+                    break;
+                case 'done':
+                    setProgress(100, message);
+                    markStepDone('Generating questions...');
+                    break;
+            }
+        }
+
+        function setProgress(pct, msg) {
+            document.getElementById('progress-bar').style.width = pct + '%';
+            document.getElementById('loading-msg').textContent = msg;
+        }
+
+        function clearProgressSteps() {
+            document.getElementById('progress-steps').innerHTML = '';
+        }
+
+        function addProgressStep(text, state) {
+            const steps = document.getElementById('progress-steps');
+            // Don't add duplicate "generating" steps - update the last one
+            const existing = steps.querySelectorAll('.progress-step');
+            if (existing.length > 0 && text.startsWith('Generating questions')) {
+                const last = existing[existing.length - 1];
+                if (last.textContent.includes('Generating questions')) {
+                    last.textContent = text;
+                    last.className = 'progress-step ' + state;
+                    return;
+                }
+            }
+            const div = document.createElement('div');
+            div.className = 'progress-step ' + state;
+            div.textContent = text;
+            steps.appendChild(div);
+        }
+
+        function markStepDone(text) {
+            const steps = document.getElementById('progress-steps').querySelectorAll('.progress-step');
+            for (const step of steps) {
+                if (step.textContent.includes(text) || step.textContent === text) {
+                    step.className = 'progress-step done';
+                    return;
+                }
+            }
+        }
+
+        function renderQuiz(quiz) {
+            document.getElementById('quiz-title').textContent = quiz.title;
+            document.getElementById('quiz-meta').innerHTML =
+                `<span class="lang-chip">Q${quiz.questions.length}</span>` +
+                `<span class="lang-chip auto">${quiz.language.toUpperCase()}</span>`;
+
+            // PDF download buttons on quiz page
+            document.getElementById('quiz-pdf-buttons').innerHTML = pdfButtonHTML(quiz.id, ['quiz', 'answers']);
+
+            const container = document.getElementById('questions-container');
+            container.innerHTML = quiz.questions.map((q, i) => `
+                <div class="card question">
+                    <div class="question-number">Question ${i + 1} of ${quiz.questions.length}</div>
+                    <div class="question-text">${escHtml(q.question)}</div>
+                    <ul class="options">
+                        ${q.options.map((opt, j) => `
+                            <li class="option" onclick="selectOption(${i}, ${j})" id="opt-${i}-${j}">
+                                <input type="radio" name="q${i}" value="${j}" id="radio-${i}-${j}">
+                                <label for="radio-${i}-${j}">${escHtml(opt)}</label>
+                            </li>
+                        `).join('')}
+                    </ul>
+                </div>
+            `).join('');
+
+            showSection('quiz');
+        }
+
+        function selectOption(qIdx, optIdx) {
+            // Deselect all options for this question
+            document.querySelectorAll(`[id^="opt-${qIdx}-"]`).forEach(el => el.classList.remove('selected'));
+            // Select this one
+            document.getElementById(`opt-${qIdx}-${optIdx}`).classList.add('selected');
+            document.getElementById(`radio-${qIdx}-${optIdx}`).checked = true;
+        }
+
+        // ---- Submit Quiz ----
+        document.getElementById('quiz-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            if (!currentQuiz) return;
+
+            const answers = [];
+            for (let i = 0; i < currentQuiz.questions.length; i++) {
+                const selected = document.querySelector(`input[name="q${i}"]:checked`);
+                if (!selected) {
+                    alert(`Please answer question ${i + 1}`);
+                    return;
+                }
+                answers.push(parseInt(selected.value));
+            }
+
+            showSection('loading');
+            document.getElementById('loading-msg').textContent = 'Scoring your answers...';
+
+            try {
+                const res = await fetch(`${API}/api/quiz/submit`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ quiz_id: currentQuiz.id, answers })
+                });
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || `Error ${res.status}`);
+                }
+
+                const result = await res.json();
+                renderResults(currentQuiz, result);
+            } catch (e) {
+                showError(e.message);
+            }
+        });
+
+        function renderResults(quiz, result) {
+            const pct = result.percentage;
+            document.getElementById('score-display').textContent = `${pct}%`;
+            document.getElementById('score-text').textContent = `${result.score} out of ${result.total} correct`;
+
+            let badge = '';
+            if (pct >= 80) badge = '<div class="badge badge-success">Great job!</div>';
+            else if (pct >= 60) badge = '<div class="badge badge-warning">Good effort!</div>';
+            else badge = '<div class="badge badge-error">Keep studying!</div>';
+            document.getElementById('score-badge').innerHTML = badge;
+
+            // PDF download buttons on results page
+            document.getElementById('results-pdf-buttons').innerHTML = pdfButtonHTML(quiz.id, ['quiz', 'answers', 'results']);
+
+            const container = document.getElementById('results-container');
+            container.innerHTML = result.details.map((d, i) => {
+                const q = quiz.questions[d.question_id];
+                return `
+                    <div class="card question">
+                        <div class="question-number">
+                            ${d.is_correct ? '<span class="result-icon">&#10003;</span>' : '<span class="result-icon">&#10007;</span>'}
+                            Question ${d.question_id + 1}
+                        </div>
+                        <div class="question-text">${escHtml(q.question)}</div>
+                        <ul class="options">
+                            ${q.options.map((opt, j) => {
+                                let cls = 'option';
+                                if (j === d.correct) cls += ' correct';
+                                if (j === d.selected && !d.is_correct) cls += ' wrong';
+                                return `<li class="${cls}">${escHtml(opt)}${j === d.correct ? ' &#10003;' : ''}${j === d.selected && j !== d.correct ? ' &#10007;' : ''}</li>`;
+                            }).join('')}
+                        </ul>
+                        <div class="explanation">${escHtml(d.explanation)}</div>
+                    </div>
+                `;
+            }).join('');
+
+            showSection('results');
+        }
+
+        // ---- UI Helpers ----
+        function pdfButtonHTML(quizId, modes) {
+            const labels = {
+                quiz: { text: 'Download Quiz (Blank)', icon: '<svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zm4 18H6V4h7v5h5v11z"/></svg>' },
+                answers: { text: 'Download Answer Key', icon: '<svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/></svg>' },
+                results: { text: 'Download Results', icon: '<svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 14l-5-5 1.41-1.41L12 14.17l6.59-6.59L20 9l-8 8z"/></svg>' }
+            };
+            return modes.map(mode => {
+                const l = labels[mode];
+                return `<a class="btn-pdf" href="${API}/api/quiz/${quizId}/pdf?mode=${mode}" target="_blank">${l.icon} ${l.text}</a>`;
+            }).join('');
+        }
+
+        function showSection(section) {
+            ['input', 'error', 'loading', 'quiz', 'results'].forEach(s => {
+                document.getElementById(`${s}-section`).classList.toggle('hidden', s !== section);
+            });
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        function showError(msg) {
+            document.getElementById('error-msg').textContent = msg;
+            showSection('error');
+        }
+
+        function goBack() {
+            showSection('input');
+            document.getElementById('youtube-url').focus();
+        }
+
+        function escHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        // Allow Enter key on URL input
+        document.getElementById('youtube-url').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') generateQuiz();
+        });
+    </script>
+</body>
+</html>
