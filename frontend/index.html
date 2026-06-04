@@ -167,6 +167,36 @@
             width: 0%;
         }
 
+        /* Question counter + ETA */
+        .gen-stats {
+            display: flex;
+            justify-content: center;
+            gap: 1.5rem;
+            margin-top: 0.75rem;
+        }
+
+        .gen-stat {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .gen-stat-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text);
+            line-height: 1.2;
+        }
+
+        .gen-stat-value.count { color: var(--primary); }
+        .gen-stat-value.eta { color: var(--warning); font-size: 1.25rem; }
+
+        .gen-stat-label {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            margin-top: 0.15rem;
+        }
+
         .progress-steps {
             margin-top: 0.75rem;
             font-size: 0.8rem;
@@ -400,6 +430,10 @@
                 font-size: 1rem;
             }
 
+            #new-quiz-btn, #submit-btn {
+                flex-basis: 100% !important;
+            }
+
             .question-text {
                 font-size: 0.95rem;
             }
@@ -439,6 +473,14 @@
 
             .progress-container {
                 height: 6px;
+            }
+
+            .gen-stats {
+                gap: 1rem;
+            }
+
+            .gen-stat-value {
+                font-size: 1.3rem;
             }
 
             .loading-text {
@@ -511,6 +553,16 @@
                 <div class="loading-text">
                     <div class="spinner"></div>
                     <div id="loading-msg">Starting...</div>
+                    <div class="gen-stats" id="gen-stats">
+                        <div class="gen-stat">
+                            <div class="gen-stat-value count" id="gen-count">0/0</div>
+                            <div class="gen-stat-label">Questions</div>
+                        </div>
+                        <div class="gen-stat">
+                            <div class="gen-stat-value eta" id="gen-eta">--</div>
+                            <div class="gen-stat-label">Est. remaining</div>
+                        </div>
+                    </div>
                     <div class="progress-container">
                         <div class="progress-bar" id="progress-bar"></div>
                     </div>
@@ -528,8 +580,9 @@
             </div>
             <form id="quiz-form">
                 <div id="questions-container"></div>
-                <div class="card">
-                    <button type="submit" class="btn" id="submit-btn">Submit Answers</button>
+                <div class="card" style="display:flex; gap:0.75rem; flex-wrap:wrap;">
+                    <button type="submit" class="btn" id="submit-btn" style="flex:1;">Submit Answers</button>
+                    <button type="button" class="btn btn-outline" id="new-quiz-btn" onclick="goBack()" style="flex:1;">New Quiz</button>
                 </div>
             </form>
         </div>
@@ -567,6 +620,9 @@
 
             showSection('loading');
             setProgress(0, 'Starting...');
+            updateGenCount(0, numQ);
+            stopEtaCountdown();
+            document.getElementById('gen-eta').textContent = '--';
             clearProgressSteps();
 
             let streamSucceeded = false;
@@ -589,6 +645,7 @@
 
                 evtSource.addEventListener('complete', (e) => {
                     evtSource.close();
+                    stopEtaCountdown();
                     const data = JSON.parse(e.data);
                     currentQuiz = data;
                     setProgress(100, 'Quiz ready!');
@@ -621,8 +678,16 @@
         // Fallback: non-streaming POST endpoint
         async function generateQuizFallback(url, numQ, diff, btn) {
             setProgress(0, 'Generating quiz (this may take 30-60 seconds)...');
+            updateGenCount(0, numQ);
+            stopEtaCountdown();
             clearProgressSteps();
             addProgressStep('Generating quiz...', 'active');
+
+            const fallbackStart = Date.now();
+
+            // Start a client-side countdown (rough estimate: ~8s per question)
+            const estimatedTotal = numQ * 8;
+            startEtaCountdown(estimatedTotal);
 
             try {
                 const res = await fetch(`${API}/api/quiz/generate`, {
@@ -637,25 +702,74 @@
                 }
 
                 currentQuiz = await res.json();
+                stopEtaCountdown();
                 setProgress(100, 'Quiz ready!');
+                updateGenCount(numQ, numQ);
+                document.getElementById('gen-eta').textContent = 'Done!';
                 btn.disabled = false;
                 renderQuiz(currentQuiz);
             } catch (e) {
+                stopEtaCountdown();
                 btn.disabled = false;
                 showError(e.message);
             }
         }
 
+        // Countdown timer for ETA — ticks every second between server events
+        let _etaInterval = null;
+        let _etaRemaining = null;
+
+        function startEtaCountdown(seconds) {
+            stopEtaCountdown();
+            _etaRemaining = seconds;
+            renderEta();
+            _etaInterval = setInterval(() => {
+                _etaRemaining--;
+                if (_etaRemaining <= 0) {
+                    _etaRemaining = 0;
+                    stopEtaCountdown();
+                }
+                renderEta();
+            }, 1000);
+        }
+
+        function stopEtaCountdown() {
+            if (_etaInterval) {
+                clearInterval(_etaInterval);
+                _etaInterval = null;
+            }
+        }
+
+        function renderEta() {
+            const etaEl = document.getElementById('gen-eta');
+            if (_etaRemaining === null || _etaRemaining === undefined) {
+                etaEl.textContent = '--';
+            } else if (_etaRemaining <= 0) {
+                etaEl.textContent = 'Almost done...';
+            } else if (_etaRemaining < 60) {
+                etaEl.textContent = `~${_etaRemaining}s`;
+            } else {
+                const mins = Math.floor(_etaRemaining / 60);
+                const secs = _etaRemaining % 60;
+                etaEl.textContent = `~${mins}m ${secs}s`;
+            }
+        }
+
         function onProgress(data) {
-            const { step, message, batch, total_batches, done, total } = data;
+            const { step, message, batch, total_batches, done, total, eta, elapsed } = data;
 
             switch (step) {
                 case 'cache':
                     setProgress(90, message);
+                    updateGenCount(total, total);
+                    stopEtaCountdown();
+                    document.getElementById('gen-eta').textContent = 'Done!';
                     addProgressStep(message, 'done');
                     break;
                 case 'transcript':
                     setProgress(10, message);
+                    stopEtaCountdown();
+                    document.getElementById('gen-eta').textContent = '--';
                     addProgressStep('Fetching transcript...', 'active');
                     break;
                 case 'transcript_done':
@@ -671,6 +785,8 @@
                     } else {
                         setProgress(50, message);
                     }
+                    if (done !== undefined && total) updateGenCount(done, total);
+                    // Keep the previous countdown running (don't restart it)
                     addProgressStep(message, 'active');
                     break;
                 case 'batch_done':
@@ -678,14 +794,26 @@
                         const pct = 25 + Math.round((done / total) * 65);
                         setProgress(pct, message);
                     }
+                    updateGenCount(done, total);
+                    // Start a fresh countdown from server's ETA
+                    if (eta !== undefined && eta !== null) {
+                        startEtaCountdown(eta);
+                    }
                     markStepDone('Generating questions...');
                     addProgressStep(message, 'done');
                     break;
                 case 'done':
                     setProgress(100, message);
+                    if (total) updateGenCount(total, total);
+                    stopEtaCountdown();
+                    document.getElementById('gen-eta').textContent = 'Done!';
                     markStepDone('Generating questions...');
                     break;
             }
+        }
+
+        function updateGenCount(done, total) {
+            document.getElementById('gen-count').textContent = `${done}/${total}`;
         }
 
         function setProgress(pct, msg) {

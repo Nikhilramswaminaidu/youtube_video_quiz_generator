@@ -23,8 +23,19 @@ FALLBACK_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
 # Rate limiting: max retries with exponential backoff
 MAX_RETRIES = 3
 INITIAL_BACKOFF_SECONDS = 2
-REQUEST_TIMEOUT = 120  # seconds — large transcripts need time
-BATCH_SIZE = 7  # questions per API call to avoid timeouts
+REQUEST_TIMEOUT = 120  # seconds — enough for 7-question batches
+BATCH_SIZE = 7  # questions per API call — sweet spot for speed + reliability
+MAX_TRANSCRIPT_CHARS = 4000  # truncate long transcripts to avoid token bloat
+
+
+def _batch_size_for(num_questions: int, difficulty: str) -> int:
+    """Pick batch size that won't timeout. Hard/long quizzes need smaller batches
+    because each question is longer and the LLM output is bigger."""
+    if difficulty == "hard" and num_questions > 20:
+        return 5
+    if difficulty == "hard" or num_questions > 20:
+        return 7
+    return 10  # easy/moderate with <=20 questions — bigger batch, fewer calls
 
 
 def _get_api_key() -> str:
@@ -39,17 +50,8 @@ def _get_api_key() -> str:
 
 
 def _build_prompt(transcript: str, num_questions: int, difficulty: str, transcript_language: str = None) -> str:
-    """Build the prompt sent to the LLM for quiz generation.
-
-    Args:
-        transcript: The video transcript text.
-        num_questions: Number of questions to generate.
-        difficulty: Quiz difficulty level.
-        transcript_language: Language code of the transcript (e.g., "hi", "es").
-                            Used to tell the LLM the transcript may not be in English.
-    """
-    # If the transcript isn't in English, tell the LLM to read it in that
-    # language but write ALL quiz content in English
+    """Build the prompt sent to the LLM for quiz generation."""
+    # Language instruction
     if transcript_language and transcript_language != "en":
         lang_names = {
             "es": "Spanish", "fr": "French", "de": "German",
@@ -61,45 +63,26 @@ def _build_prompt(transcript: str, num_questions: int, difficulty: str, transcri
         }
         base_code = transcript_language.split("-")[0]
         lang_display = lang_names.get(transcript_language, lang_names.get(base_code, transcript_language))
-        language_instruction = (
-            f"IMPORTANT: The transcript is in {lang_display}, but you MUST write the ENTIRE quiz in English. "
-            f"Read and understand the {lang_display} transcript, then translate the concepts into English. "
-            f"All questions, options, explanations, and the title must be in English."
-        )
+        lang_note = f"Transcript is in {lang_display}. Write the ENTIRE quiz in English."
     else:
-        language_instruction = (
-            "Write the entire quiz in English."
-        )
+        lang_note = "Write the entire quiz in English."
 
-    return f"""You are a UPSC-style exam question setter. Given the following video transcript, create exactly {num_questions} multiple-choice questions at {difficulty} difficulty.
+    # Truncate long transcripts to save tokens — but sample from start, middle, and end
+    # so the LLM sees the full scope of the video, not just the first few minutes
+    if len(transcript) > MAX_TRANSCRIPT_CHARS:
+        third = MAX_TRANSCRIPT_CHARS // 3
+        start = transcript[:third]
+        mid_start = (len(transcript) - third) // 2
+        mid = transcript[mid_start:mid_start + third]
+        end = transcript[-third:]
+        transcript = f"{start}\n[...middle portion skipped...]\n{mid}\n[...skipped...]\n{end}"
 
-{language_instruction}
+    return f"""Create {num_questions} UPSC-style MCQs ({difficulty} difficulty) from this transcript. {lang_note}
 
-UPSC-STYLE QUESTION REQUIREMENTS:
-- Each question must have exactly 4 options labeled A, B, C, D — only ONE is correct
-- Questions MUST be UPSC-style: analytical, conceptual, and application-oriented
-- Use these UPSC question formats (vary them across the quiz):
-  1. STATEMENT-BASED: "Which of the following statements is/are correct?" with 2-3 numbered statements, and options like "1 only", "1 and 2 only", "1, 2 and 3", "None of the above"
-  2. ASSERTION-REASON: "Assertion (A): ... Reason (R): ..." with options: "Both A and R are true and R is the correct explanation of A", "Both A and R are true but R is NOT the correct explanation of A", "A is true but R is false", "A is false but R is true"
-  3. ANALYTICAL: Questions that test cause-effect, comparisons, implications — not just factual recall
-  4. CONTEXTUAL: Questions that connect the video content to broader concepts, policies, or real-world implications
-- Distractors must be plausible and closely related to the topic — avoid obviously wrong options
-- Spread questions across DIFFERENT parts and topics in the transcript — don't cluster on one section
-- Every explanation must clearly state WHY the correct answer is right and WHY each wrong option is wrong
-- Use precise, formal language consistent with UPSC standards
+Rules: 4 options (A-D), one correct. Use varied formats: statement-based ("Which is/are correct?"), assertion-reason, analytical, contextual. Plausible distractors. Spread across different topics. Explain why correct AND why others are wrong.
 
-Return ONLY valid JSON in this exact format (no other text, no markdown):
-{{
-  "title": "Quiz: [brief topic description]",
-  "questions": [
-    {{
-      "question": "The question text?",
-      "options": ["A) Option text", "B) Option text", "C) Option text", "D) Option text"],
-      "correct_index": 0,
-      "explanation": "Detailed explanation of why the correct answer is right and why each other option is wrong."
-    }}
-  ]
-}}
+JSON only, no other text:
+{{"title": "Quiz: [topic]", "questions": [{{"question": "...", "options": ["A) ...", "B) ...", "C) ...", "D) ..."], "correct_index": 0, "explanation": "..."}}]}}
 
 TRANSCRIPT:
 {transcript}"""
@@ -200,7 +183,9 @@ def generate_quiz(
         raise ValueError("difficulty must be 'easy', 'moderate', or 'hard'")
 
     # For large question counts, split into batches to avoid timeouts
-    if num_questions <= BATCH_SIZE:
+    effective_batch = _batch_size_for(num_questions, difficulty)
+
+    if num_questions <= effective_batch:
         # Single batch — generate all at once
         return _generate_batch(
             transcript=transcript,
@@ -217,8 +202,8 @@ def generate_quiz(
     title = None
     remaining = num_questions
 
-    for batch_num in range((num_questions + BATCH_SIZE - 1) // BATCH_SIZE):
-        batch_count = min(BATCH_SIZE, remaining)
+    for batch_num in range((num_questions + effective_batch - 1) // effective_batch):
+        batch_count = min(effective_batch, remaining)
         print(f"  Batch {batch_num + 1}: generating {batch_count} questions...")
 
         batch_quiz = _generate_batch(
@@ -228,7 +213,7 @@ def generate_quiz(
             difficulty=difficulty,
             transcript_language=transcript_language,
             model=model,
-            batch_offset=batch_num * BATCH_SIZE,
+            batch_offset=batch_num * effective_batch,
         )
 
         if title is None:
@@ -236,10 +221,6 @@ def generate_quiz(
 
         all_questions.extend(batch_quiz.questions)
         remaining -= batch_count
-
-        # Small delay between batches to avoid rate limiting
-        if remaining > 0:
-            time.sleep(1)
 
     return Quiz(
         title=title or f"Quiz: Video {video_id}",
@@ -286,23 +267,25 @@ def _generate_batch(
         "Content-Type": "application/json",
     }
 
+    # Scale max_tokens by batch size: fewer questions = smaller response = faster
+    max_tokens = min(num_questions * 250, 2000)
+
     payload = {
         "model": model,
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "You are a UPSC-style exam question setter. "
-                    "Always respond with valid JSON only. "
-                    "No markdown, no explanations outside the JSON."
-                ),
+                "content": "You are a UPSC exam question setter. Respond with valid JSON only. No markdown. Keep explanations concise (1-2 sentences).",
             },
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.4,
-        "max_tokens": 4000,
+        "max_tokens": max_tokens,
         "stream": False,
     }
+
+    # Timeout: scale with batch size — bigger batches need more time
+    timeout = REQUEST_TIMEOUT + (num_questions * 5)  # extra 5s per question
 
     last_error = None
     for attempt in range(MAX_RETRIES):
@@ -311,7 +294,7 @@ def _generate_batch(
                 NIM_BASE_URL,
                 headers=headers,
                 json=payload,
-                timeout=REQUEST_TIMEOUT,
+                timeout=timeout,
             )
             response.raise_for_status()
 

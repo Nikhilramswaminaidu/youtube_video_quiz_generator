@@ -18,7 +18,7 @@ from backend.app.models.schemas import (
     ErrorResponse,
 )
 from backend.app.services.transcript import extract_video_id, get_transcript
-from backend.app.services.quiz_generator import generate_quiz, _generate_batch, BATCH_SIZE
+from backend.app.services.quiz_generator import generate_quiz, _generate_batch, _batch_size_for
 from backend.app.services.pdf_generator import generate_quiz_pdf, generate_results_pdf
 
 router = APIRouter(prefix="/api/quiz", tags=["quiz"])
@@ -143,6 +143,9 @@ async def generate_quiz_stream(
 
     async def event_stream():
         try:
+            import time as _time
+            gen_start = _time.time()
+
             # Check cache first
             cached = _check_cache(video_id, num_questions, difficulty)
             if cached:
@@ -159,21 +162,25 @@ async def generate_quiz_stream(
                 yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
                 return
 
-            yield f"event: progress\ndata: {json.dumps({'step': 'transcript_done', 'message': f'Transcript ready ({result.char_count:,} chars, {result.language})'})}\n\n"
+            elapsed = round(_time.time() - gen_start, 1)
+            yield f"event: progress\ndata: {json.dumps({'step': 'transcript_done', 'message': f'Transcript ready ({result.char_count:,} chars, {result.language})', 'elapsed': elapsed})}\n\n"
 
             # Step 2: Generate quiz in batches with progress
             all_questions = []
             title = None
-            total_batches = (num_questions + BATCH_SIZE - 1) // BATCH_SIZE
+            effective_batch = _batch_size_for(num_questions, difficulty)
+            total_batches = (num_questions + effective_batch - 1) // effective_batch
+            batch_times = []  # track how long each batch takes
 
             for batch_num in range(total_batches):
-                batch_count = min(BATCH_SIZE, num_questions - len(all_questions))
+                batch_count = min(effective_batch, num_questions - len(all_questions))
                 current_batch = batch_num + 1
-                yield f"event: progress\ndata: {json.dumps({'step': 'generating', 'message': f'Generating questions (batch {current_batch}/{total_batches})...', 'batch': current_batch, 'total_batches': total_batches})}\n\n"
+                yield f"event: progress\ndata: {json.dumps({'step': 'generating', 'message': f'Generating questions (batch {current_batch}/{total_batches})...', 'batch': current_batch, 'total_batches': total_batches, 'done': len(all_questions), 'total': num_questions})}\n\n"
 
                 # Keepalive ping before long LLM call
                 yield f": keepalive\n\n"
 
+                batch_start = _time.time()
                 try:
                     batch_quiz = await asyncio.to_thread(
                         _generate_batch,
@@ -182,15 +189,21 @@ async def generate_quiz_stream(
                         num_questions=batch_count,
                         difficulty=difficulty,
                         transcript_language=result.language,
-                        batch_offset=batch_num * BATCH_SIZE,
+                        batch_offset=batch_num * effective_batch,
                     )
+                    batch_elapsed = _time.time() - batch_start
+                    batch_times.append(batch_elapsed)
                     if title is None:
                         title = batch_quiz.title
                     all_questions.extend(batch_quiz.questions)
 
-                    # Progress update after each batch
+                    # Calculate ETA based on average batch time
                     done = len(all_questions)
-                    yield f"event: progress\ndata: {json.dumps({'step': 'batch_done', 'message': f'{done}/{num_questions} questions generated', 'done': done, 'total': num_questions})}\n\n"
+                    remaining_batches = total_batches - (batch_num + 1)
+                    avg_batch_time = sum(batch_times) / len(batch_times)
+                    eta_seconds = round(remaining_batches * avg_batch_time)
+
+                    yield f"event: progress\ndata: {json.dumps({'step': 'batch_done', 'message': f'{done}/{num_questions} questions generated', 'done': done, 'total': num_questions, 'eta': eta_seconds, 'elapsed': round(_time.time() - gen_start, 1)})}\n\n"
                 except Exception as e:
                     yield f"event: error\ndata: {json.dumps({'error': f'Generation failed: {str(e)}'})}\n\n"
                     return
@@ -207,7 +220,8 @@ async def generate_quiz_stream(
             _quizzes[video_id] = quiz_data
             _store_cache(video_id, num_questions, difficulty, quiz_data)
 
-            yield f"event: progress\ndata: {json.dumps({'step': 'done', 'message': f'Quiz ready! {len(all_questions)} questions generated.'})}\n\n"
+            total_time = round(_time.time() - gen_start, 1)
+            yield f"event: progress\ndata: {json.dumps({'step': 'done', 'message': f'Quiz ready! {len(all_questions)} questions generated.', 'elapsed': total_time})}\n\n"
             yield f"event: complete\ndata: {json.dumps(_build_quiz_response(video_id, quiz_data))}\n\n"
 
         except Exception as e:
