@@ -1,6 +1,9 @@
 """YouTube transcript extraction service."""
 
+import json
+import logging
 import re
+import subprocess
 from typing import Optional
 
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -11,6 +14,8 @@ from youtube_transcript_api._errors import (
 )
 
 from backend.app.models.schemas import TranscriptResult
+
+logger = logging.getLogger(__name__)
 
 
 # Regex patterns for extracting video IDs from various YT URL formats
@@ -107,7 +112,9 @@ def get_transcript(
 ) -> TranscriptResult:
     """Fetch transcript for a YouTube video.
 
-    Uses the youtube-transcript-api v1.x API (instance-based).
+    Uses the youtube-transcript-api v1.x API (instance-based) first,
+    then falls back to yt-dlp if blocked by cloud/datacenter IP restrictions.
+
     Prefers manually created captions over auto-generated ones.
     Supports YouTube's built-in translation for languages that don't have
     direct captions but are available as translation targets.
@@ -168,6 +175,12 @@ def get_transcript(
         if translated:
             return translated
 
+        # youtube-transcript-api didn't work — fall back to yt-dlp
+        logger.info(f"youtube-transcript-api: no transcript found for {video_id}, trying yt-dlp fallback")
+        ytdlp_result = _fetch_transcript_ytdlp(video_id, target_lang.split("-")[0])
+        if ytdlp_result:
+            return ytdlp_result
+
         # No direct captions and translation didn't work
         available = _format_available_languages(transcript_list)
         raise RuntimeError(
@@ -175,7 +188,7 @@ def get_transcript(
             f"Available direct captions:\n{available}\n\n"
             "Tip: This video may have translation support (shown as 'translatable'). "
             "Translation works from a home internet connection but may be blocked "
-            "from cloud/datacenter IPs. Try running from your local machine.\n\n"
+            "from cloud/datacenter IPs.\n\n"
             "Alternatively, use the English transcript (auto-detected by default) "
             "and the quiz will still be generated in English."
         )
@@ -190,6 +203,19 @@ def get_transcript(
             f"Video {video_id} is unavailable. "
             "It may be private, age-restricted, or deleted."
         )
+    except Exception as e:
+        # Catch IP block errors and other unexpected failures — fall back to yt-dlp
+        if _is_ip_blocked_error(e):
+            logger.warning(
+                f"youtube-transcript-api blocked for {video_id}: {e}. "
+                "Falling back to yt-dlp."
+            )
+            target_lang = (languages[0] if languages else "en").split("-")[0]
+            ytdlp_result = _fetch_transcript_ytdlp(video_id, target_lang)
+            if ytdlp_result:
+                return ytdlp_result
+
+        raise
 
 
 def _try_translate(transcript_list, target_lang: str, video_id: str) -> Optional[TranscriptResult]:
@@ -248,6 +274,260 @@ def _try_translate(transcript_list, target_lang: str, video_id: str) -> Optional
                 continue
 
     return None
+
+
+def _fetch_transcript_ytdlp(video_id: str, language: str = "en") -> Optional[TranscriptResult]:
+    """Fallback: fetch transcript using yt-dlp when youtube-transcript-api fails.
+
+    yt-dlp downloads subtitles directly from YouTube and works from cloud IPs
+    where the youtube-transcript-api Python library gets blocked.
+
+    Args:
+        video_id: The 11-character YouTube video ID.
+        language: Preferred language code (e.g., "en", "es"). Defaults to "en".
+
+    Returns:
+        A TranscriptResult if subtitles are found, None if not available.
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # Build yt-dlp command: dump subtitle info as JSON, prefer manual subs
+    # --write-subs --write-auto-subs ensures both manual and auto captions are considered
+    # --skip-download avoids downloading the video itself
+    # -j dumps video info JSON including available subtitles
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs", f"{language},{language[:2]},en,en-US,en-GB",
+        "--output", "-",  # output to stdout
+        "--print", "requested_subtitles",  # print subtitle URLs
+        "-j",  # dump full video info as JSON
+        url,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"yt-dlp returned non-zero exit code: {result.stderr[:500]}")
+            # Try alternative approach: download subtitle file directly
+            return _fetch_transcript_ytdlp_direct(video_id, language)
+
+        # Parse JSON output from yt-dlp
+        # -j outputs one JSON object per line (playlist entries), take last one
+        lines = result.stdout.strip().splitlines()
+        video_info = None
+        for line in reversed(lines):
+            try:
+                parsed = json.loads(line)
+                if "requested_subtitles" in parsed or "subtitles" in parsed:
+                    video_info = parsed
+                    break
+            except json.JSONDecodeError:
+                continue
+
+        if not video_info:
+            logger.warning("yt-dlp: could not parse video info JSON")
+            return _fetch_transcript_ytdlp_direct(video_id, language)
+
+        # Try to find subtitle URL in requested_subtitles, then subtitles, then automatic_captions
+        subtitle_url = None
+        sub_lang = language
+
+        # requested_subtitles has the resolved subtitle info
+        requested = video_info.get("requested_subtitles") or {}
+        for lang_key in [language, language.split("-")[0], "en", "en-US"]:
+            if lang_key in requested:
+                sub_info = requested[lang_key]
+                if isinstance(sub_info, dict):
+                    subtitle_url = sub_info.get("url") or sub_info.get("path")
+                else:
+                    subtitle_url = str(sub_info)
+                sub_lang = lang_key
+                break
+
+        if not subtitle_url:
+            # Fall back to automatic_captions
+            auto_caps = video_info.get("automatic_captions") or {}
+            for lang_key in [language, language.split("-")[0], "en"]:
+                if lang_key in auto_caps:
+                    subs = auto_caps[lang_key]
+                    # Prefer srv1 (YouTube's native format), then vtt, then any
+                    for fmt_key in ["srv1", "srv2", "srv3", "vtt", "ttml"]:
+                        for sub in subs:
+                            if sub.get("ext") == fmt_key or fmt_key in (sub.get("url") or ""):
+                                subtitle_url = sub.get("url")
+                                sub_lang = lang_key
+                                break
+                        if subtitle_url:
+                            break
+                    if not subtitle_url and subs:
+                        subtitle_url = subs[0].get("url")
+                        sub_lang = lang_key
+                    break
+
+        if not subtitle_url:
+            logger.warning(f"yt-dlp: no subtitle URL found for language '{language}'")
+            return _fetch_transcript_ytdlp_direct(video_id, language)
+
+        # Download the subtitle content
+        import requests
+        sub_response = requests.get(subtitle_url, timeout=30)
+        sub_response.raise_for_status()
+        sub_content = sub_response.text
+
+        # Parse subtitle content (YouTube srv1 format is XML, vtt is text)
+        text = _parse_subtitle_content(sub_content)
+
+        if not text or len(text.strip()) < 20:
+            logger.warning(f"yt-dlp: parsed subtitle text too short ({len(text)} chars)")
+            return _fetch_transcript_ytdlp_direct(video_id, language)
+
+        return TranscriptResult(
+            video_id=video_id,
+            text=text,
+            language=sub_lang,
+            is_auto_generated=True,
+        )
+
+    except subprocess.TimeoutExpired:
+        logger.warning("yt-dlp: timed out after 60s")
+        return _fetch_transcript_ytdlp_direct(video_id, language)
+    except Exception as e:
+        logger.warning(f"yt-dlp fallback failed: {e}")
+        return _fetch_transcript_ytdlp_direct(video_id, language)
+
+
+def _fetch_transcript_ytdlp_direct(video_id: str, language: str = "en") -> Optional[TranscriptResult]:
+    """Download subtitle file directly via yt-dlp and parse it.
+
+    Used as a second fallback when the JSON info dump approach doesn't work.
+    Downloads the subtitle file to a temp location, reads it, and cleans up.
+    """
+    import tempfile
+    import os
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    base_lang = language.split("-")[0]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Try manual subs first, then auto subs
+        for auto_flag in [["--write-subs", "--no-write-auto-subs"], ["--write-auto-subs", "--no-write-subs"]]:
+            cmd = [
+                "yt-dlp",
+                "--skip-download",
+                *auto_flag,
+                "--sub-langs", f"{base_lang},en",
+                "--convert-subs", "srt",  # Convert to SRT for easy parsing
+                "-o", os.path.join(tmpdir, "sub"),
+                url,
+            ]
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+
+                # Find any subtitle files written
+                sub_files = [
+                    f for f in os.listdir(tmpdir)
+                    if f.startswith("sub") and (f.endswith(".srt") or f.endswith(".vtt"))
+                ]
+
+                if sub_files:
+                    sub_path = os.path.join(tmpdir, sub_files[0])
+                    with open(sub_path, encoding="utf-8", errors="replace") as f:
+                        sub_content = f.read()
+
+                    text = _parse_subtitle_content(sub_content)
+                    if text and len(text.strip()) >= 20:
+                        # Determine language from filename
+                        fname = sub_files[0]
+                        sub_lang = language
+                        if "." in fname and fname.rstrip(".srt").rstrip(".vtt").split(".")[-1] not in ("sub",):
+                            sub_lang = fname.rstrip(".srt").rstrip(".vtt").split(".")[-1]
+
+                        return TranscriptResult(
+                            video_id=video_id,
+                            text=text,
+                            language=sub_lang,
+                            is_auto_generated="--write-auto-subs" in auto_flag,
+                        )
+            except subprocess.TimeoutExpired:
+                logger.warning("yt-dlp direct: timed out")
+                continue
+            except Exception as e:
+                logger.warning(f"yt-dlp direct fallback error: {e}")
+                continue
+
+    return None
+
+
+def _parse_subtitle_content(content: str) -> str:
+    """Parse subtitle content from SRT, VTT, or XML (srv1) formats.
+
+    Extracts plain text from subtitle files, stripping timestamps and formatting.
+    """
+    text_parts = []
+
+    if "<transcript>" in content or "<?xml" in content:
+        # YouTube srv1/srv3 XML format
+        import re as _re
+        # Remove XML tags, keep text content
+        text = _re.sub(r"<[^>]+>", " ", content)
+        # Clean up whitespace
+        text = _re.sub(r"\s+", " ", text).strip()
+        return text
+
+    # SRT or VTT format — extract text lines, skip timestamps and numbers
+    for line in content.splitlines():
+        line = line.strip()
+        # Skip timestamp lines (e.g., "00:01:23,456 --> 00:01:25,789")
+        if "-->" in line:
+            continue
+        # Skip sequence numbers (standalone digits on a line)
+        if line.isdigit():
+            continue
+        # Skip WEBVTT header and other metadata
+        if line.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")):
+            continue
+        # Skip empty lines
+        if not line:
+            continue
+        # Strip HTML tags that may be in the subtitles
+        import re as _re
+        clean = _re.sub(r"<[^>]+>", "", line)
+        # Strip VTT positioning tags like <c> or alignment info
+        clean = clean.strip()
+        if clean:
+            text_parts.append(clean)
+
+    return " ".join(text_parts)
+
+
+def _is_ip_blocked_error(error: Exception) -> bool:
+    """Check if an error is likely caused by YouTube blocking cloud/datacenter IPs."""
+    err_type = type(error).__name__
+    err_msg = str(error).lower()
+    # Specific error patterns from youtube-transcript-api on cloud IPs
+    return (
+        "ipblocked" in err_type.lower()
+        or "ipblockedexception" in err_type.lower()
+        or "blocked" in err_msg and "transcript" in err_msg
+        or "access denied" in err_msg
+        or "not allowed" in err_msg
+        or "request was rejected" in err_msg
+    )
 
 
 def _build_language_preference(transcript_list) -> list[str]:
