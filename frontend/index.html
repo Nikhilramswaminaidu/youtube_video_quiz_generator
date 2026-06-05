@@ -779,14 +779,16 @@
                     addProgressStep('Generating questions...', 'active');
                     break;
                 case 'generating':
-                    if (total_batches) {
+                    if (batch !== undefined && total_batches) {
                         const pct = 25 + Math.round((batch / total_batches) * 65);
+                        setProgress(pct, message);
+                    } else if (done !== undefined && total) {
+                        const pct = 25 + Math.round((done / total) * 65);
                         setProgress(pct, message);
                     } else {
                         setProgress(50, message);
                     }
                     if (done !== undefined && total) updateGenCount(done, total);
-                    // Keep the previous countdown running (don't restart it)
                     addProgressStep(message, 'active');
                     break;
                 case 'batch_done':
@@ -795,11 +797,19 @@
                         setProgress(pct, message);
                     }
                     updateGenCount(done, total);
-                    // Start a fresh countdown from server's ETA
                     if (eta !== undefined && eta !== null) {
                         startEtaCountdown(eta);
                     }
                     markStepDone('Generating questions...');
+                    addProgressStep(message, 'done');
+                    break;
+                case 'dedup':
+                    setProgress(88, message);
+                    addProgressStep('Removing duplicates...', 'active');
+                    break;
+                case 'dedup_done':
+                    setProgress(92, message);
+                    markStepDone('Removing duplicates...');
                     addProgressStep(message, 'done');
                     break;
                 case 'done':

@@ -1,9 +1,12 @@
-"""Quiz generation service using NVIDIA NIM API."""
+"""Quiz generation service using NVIDIA NIM API — sequential batches with dedup."""
 
+import asyncio
+import difflib
 import json
+import logging
 import os
-import time
 import re as regex
+import time
 from typing import Optional
 
 import requests
@@ -13,6 +16,8 @@ from backend.app.models.schemas import Quiz, QuizQuestion
 
 # Load environment variables from .env file
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # ─── NVIDIA NIM Configuration ───────────────────────────────────────────────
 
@@ -24,9 +29,11 @@ FALLBACK_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
 MAX_RETRIES = 3
 INITIAL_BACKOFF_SECONDS = 2
 REQUEST_TIMEOUT = 120  # seconds — enough for 7-question batches
-BATCH_SIZE = 7  # questions per API call — sweet spot for speed + reliability
+BATCH_SIZE = 7  # module-level constant (used by SSE import)
 MAX_TRANSCRIPT_CHARS = 4000  # truncate long transcripts to avoid token bloat
 
+
+# ─── Batch Sizing ────────────────────────────────────────────────────────────
 
 def _batch_size_for(num_questions: int, difficulty: str) -> int:
     """Pick batch size that won't timeout. Hard/long quizzes need smaller batches
@@ -37,6 +44,8 @@ def _batch_size_for(num_questions: int, difficulty: str) -> int:
         return 7
     return 10  # easy/moderate with <=20 questions — bigger batch, fewer calls
 
+
+# ─── API Key ─────────────────────────────────────────────────────────────────
 
 def _get_api_key() -> str:
     """Read the NVIDIA API key from environment."""
@@ -49,7 +58,15 @@ def _get_api_key() -> str:
     return api_key
 
 
-def _build_prompt(transcript: str, num_questions: int, difficulty: str, transcript_language: str = None) -> str:
+# ─── Prompt Building ────────────────────────────────────────────────────────
+
+def _build_prompt(
+    transcript: str,
+    num_questions: int,
+    difficulty: str,
+    transcript_language: str = None,
+    exclude_topics: list[str] | None = None,
+) -> str:
     """Build the prompt sent to the LLM for quiz generation."""
     # Language instruction
     if transcript_language and transcript_language != "en":
@@ -68,7 +85,6 @@ def _build_prompt(transcript: str, num_questions: int, difficulty: str, transcri
         lang_note = "Write the entire quiz in English."
 
     # Truncate long transcripts to save tokens — but sample from start, middle, and end
-    # so the LLM sees the full scope of the video, not just the first few minutes
     if len(transcript) > MAX_TRANSCRIPT_CHARS:
         third = MAX_TRANSCRIPT_CHARS // 3
         start = transcript[:third]
@@ -77,7 +93,7 @@ def _build_prompt(transcript: str, num_questions: int, difficulty: str, transcri
         end = transcript[-third:]
         transcript = f"{start}\n[...middle portion skipped...]\n{mid}\n[...skipped...]\n{end}"
 
-    return f"""Create {num_questions} UPSC-style MCQs ({difficulty} difficulty) from this transcript. {lang_note}
+    prompt = f"""Create {num_questions} UPSC-style MCQs ({difficulty} difficulty) from this transcript. {lang_note}
 
 Rules: 4 options (A-D), one correct. Use varied formats: statement-based ("Which is/are correct?"), assertion-reason, analytical, contextual. Plausible distractors. Spread across different topics. Explain why correct AND why others are wrong.
 
@@ -87,26 +103,83 @@ JSON only, no other text:
 TRANSCRIPT:
 {transcript}"""
 
+    # Add exclusion list to prevent duplicate topics
+    if exclude_topics:
+        topic_list = "\n".join(f"- {t}" for t in exclude_topics)
+        prompt += f"\n\nIMPORTANT: The following topics have already been covered in earlier questions. DO NOT create similar questions about these topics:\n{topic_list}\nFocus on DIFFERENT topics/sections of the transcript."
+
+    return prompt
+
+
+# ─── Transcript Sectioning ───────────────────────────────────────────────────
+
+def _split_transcript(transcript: str, num_sections: int, overlap_chars: int = 200) -> list[str]:
+    """Split transcript into N sections with overlap windows for context continuity.
+
+    Each batch gets a different section of the video, producing naturally
+    diverse questions while the overlap avoids cutting mid-sentence context.
+    """
+    if num_sections <= 1 or len(transcript) <= MAX_TRANSCRIPT_CHARS:
+        return [transcript] * num_sections
+
+    section_size = len(transcript) // num_sections
+    sections = []
+    for i in range(num_sections):
+        start = max(0, i * section_size - overlap_chars)
+        if i < num_sections - 1:
+            end = min(len(transcript), (i + 1) * section_size + overlap_chars)
+        else:
+            end = len(transcript)
+        sections.append(transcript[start:end])
+    return sections
+
+
+# ─── Deduplication ───────────────────────────────────────────────────────────
+
+def _deduplicate_questions(
+    questions: list[QuizQuestion],
+    similarity_threshold: float = 0.7,
+) -> tuple[list[QuizQuestion], list[QuizQuestion]]:
+    """Remove similar questions. Returns (kept_questions, removed_questions).
+
+    When duplicates are found, keeps the one with the longer explanation.
+    """
+    kept: list[QuizQuestion] = []
+    removed: list[QuizQuestion] = []
+
+    for q in questions:
+        is_dup = False
+        for k_idx, k in enumerate(kept):
+            ratio = difflib.SequenceMatcher(
+                None,
+                q.question.lower().strip(),
+                k.question.lower().strip(),
+            ).ratio()
+            if ratio >= similarity_threshold:
+                is_dup = True
+                if len(q.explanation) > len(k.explanation):
+                    removed.append(k)
+                    kept[k_idx] = q
+                else:
+                    removed.append(q)
+                break
+        if not is_dup:
+            kept.append(q)
+
+    return kept, removed
+
+
+# ─── Response Parsing ───────────────────────────────────────────────────────
 
 def _parse_quiz_response(raw_response: str, video_id: str) -> Quiz:
-    """Parse the LLM response into a Quiz object.
-
-    Handles common issues:
-    - JSON wrapped in markdown code fences (```json ... ```)
-    - Conversational text before/after JSON
-    - Trailing commas or other minor JSON issues
-    """
+    """Parse the LLM response into a Quiz object."""
     text = raw_response.strip()
 
-    # Strip markdown code fences if present
     if "```" in text:
-        # Extract content between code fences
         fence_match = regex.search(r"```(?:json)?\s*\n?(.*?)```", text, regex.DOTALL)
         if fence_match:
             text = fence_match.group(1).strip()
 
-    # Try to find JSON object in the response
-    # Look for the outermost { ... } pair
     brace_start = text.find("{")
     brace_end = text.rfind("}")
     if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
@@ -120,7 +193,6 @@ def _parse_quiz_response(raw_response: str, video_id: str) -> Quiz:
             f"Raw response (first 500 chars): {raw_response[:500]}"
         )
 
-    # Validate structure
     if "questions" not in data:
         raise ValueError("LLM response missing 'questions' key")
 
@@ -145,90 +217,7 @@ def _parse_quiz_response(raw_response: str, video_id: str) -> Quiz:
     )
 
 
-def generate_quiz(
-    transcript: str,
-    video_id: str,
-    num_questions: int = 5,
-    difficulty: str = "moderate",
-    model: Optional[str] = None,
-    transcript_language: Optional[str] = None,
-) -> Quiz:
-    """Generate a quiz from a video transcript using NVIDIA NIM.
-
-    The quiz is ALWAYS generated in English. If the transcript is in a
-    non-English language, the LLM will translate concepts into English.
-
-    Args:
-        transcript: The full transcript text from the video.
-        video_id: YouTube video ID (used for reference in the quiz title).
-        num_questions: Number of questions to generate (1-20).
-        difficulty: Quiz difficulty — "easy", "moderate", or "hard".
-        model: NVIDIA NIM model to use. Defaults to llama-3.3-70b-instruct.
-        transcript_language: Language code of the transcript (e.g., "hi", "es").
-                  Used to tell the LLM the transcript may not be in English.
-                  If None, assumes English.
-
-    Returns:
-        A Quiz object with generated questions.
-
-    Raises:
-        EnvironmentError: If NVIDIA_API_KEY is not set.
-        ValueError: If the LLM response cannot be parsed.
-        RuntimeError: If all retry attempts fail.
-    """
-    if not 1 <= num_questions <= 30:
-        raise ValueError("num_questions must be between 1 and 30")
-
-    if difficulty not in ("easy", "moderate", "hard"):
-        raise ValueError("difficulty must be 'easy', 'moderate', or 'hard'")
-
-    # For large question counts, split into batches to avoid timeouts
-    effective_batch = _batch_size_for(num_questions, difficulty)
-
-    if num_questions <= effective_batch:
-        # Single batch — generate all at once
-        return _generate_batch(
-            transcript=transcript,
-            video_id=video_id,
-            num_questions=num_questions,
-            difficulty=difficulty,
-            transcript_language=transcript_language,
-            model=model,
-            batch_offset=0,
-        )
-
-    # Multiple batches — generate in groups and combine
-    all_questions = []
-    title = None
-    remaining = num_questions
-
-    for batch_num in range((num_questions + effective_batch - 1) // effective_batch):
-        batch_count = min(effective_batch, remaining)
-        print(f"  Batch {batch_num + 1}: generating {batch_count} questions...")
-
-        batch_quiz = _generate_batch(
-            transcript=transcript,
-            video_id=video_id,
-            num_questions=batch_count,
-            difficulty=difficulty,
-            transcript_language=transcript_language,
-            model=model,
-            batch_offset=batch_num * effective_batch,
-        )
-
-        if title is None:
-            title = batch_quiz.title
-
-        all_questions.extend(batch_quiz.questions)
-        remaining -= batch_count
-
-    return Quiz(
-        title=title or f"Quiz: Video {video_id}",
-        video_id=video_id,
-        questions=all_questions,
-        language="en",
-    )
-
+# ─── Sync Batch Generation ──────────────────────────────────────────────────
 
 def _generate_batch(
     transcript: str,
@@ -238,28 +227,34 @@ def _generate_batch(
     transcript_language: Optional[str] = None,
     model: Optional[str] = None,
     batch_offset: int = 0,
+    exclude_topics: list[str] | None = None,
+    transcript_section: str | None = None,
 ) -> Quiz:
     """Generate a single batch of questions via the NVIDIA NIM API.
 
     Args:
-        transcript: The transcript text.
+        transcript: The full transcript text (used if transcript_section is None).
         video_id: YouTube video ID.
         num_questions: Number of questions for THIS batch.
         difficulty: Quiz difficulty.
         transcript_language: Language of the transcript.
         model: LLM model to use.
-        batch_offset: Question number offset (e.g., "questions 8-14 of 15").
+        batch_offset: Question number offset for diversity instructions.
+        exclude_topics: Topics already covered — the LLM will avoid these.
+        transcript_section: A specific section of the transcript to use instead of the full one.
     """
     api_key = _get_api_key()
     model = model or DEFAULT_MODEL
 
-    # Adjust prompt for batches — tell the model which questions to focus on
+    # Use section if provided, otherwise full transcript
+    effective_transcript = transcript_section if transcript_section else transcript
+
+    # Build prompt with optional topic exclusion
+    prompt = _build_prompt(effective_transcript, num_questions, difficulty, transcript_language, exclude_topics=exclude_topics)
+
+    # Add batch offset instruction for diversity
     if batch_offset > 0:
-        prompt = _build_prompt(transcript, num_questions, difficulty, transcript_language)
-        # Add instruction to avoid repeating earlier questions
         prompt += f"\n\nIMPORTANT: These are questions {batch_offset + 1} through {batch_offset + num_questions} of a larger quiz. Cover DIFFERENT topics/sections than earlier questions."
-    else:
-        prompt = _build_prompt(transcript, num_questions, difficulty, transcript_language)
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -285,7 +280,7 @@ def _generate_batch(
     }
 
     # Timeout: scale with batch size — bigger batches need more time
-    timeout = REQUEST_TIMEOUT + (num_questions * 5)  # extra 5s per question
+    timeout = REQUEST_TIMEOUT + (num_questions * 5)
 
     last_error = None
     for attempt in range(MAX_RETRIES):
@@ -305,18 +300,15 @@ def _generate_batch(
         except requests.exceptions.HTTPError as e:
             last_error = e
             status = e.response.status_code if e.response is not None else "unknown"
-            # Don't retry on auth errors
             if status == 401:
                 raise EnvironmentError(
                     f"NVIDIA API returned 401 Unauthorized. "
                     f"Check your NVIDIA_API_KEY in .env"
                 ) from e
-            # Retry on rate limit or server errors
             if attempt < MAX_RETRIES - 1:
                 wait = INITIAL_BACKOFF_SECONDS * (2 ** attempt)
                 print(f"  Attempt {attempt + 1} failed (HTTP {status}): {e}. Retrying in {wait}s...")
                 time.sleep(wait)
-            # Try fallback model on last attempt
             if attempt == MAX_RETRIES - 1 and model != FALLBACK_MODEL:
                 print(f"  Trying fallback model: {FALLBACK_MODEL}")
                 payload["model"] = FALLBACK_MODEL
@@ -343,3 +335,126 @@ def _generate_batch(
     raise RuntimeError(
         f"Failed to generate quiz after {MAX_RETRIES} attempts. Last error: {last_error}"
     )
+
+
+# ─── Async Quiz Generation (Main Entry Point) ────────────────────────────────
+
+async def generate_quiz(
+    transcript: str,
+    video_id: str,
+    num_questions: int = 5,
+    difficulty: str = "moderate",
+    model: Optional[str] = None,
+    transcript_language: Optional[str] = None,
+) -> Quiz:
+    """Generate a quiz from a video transcript using NVIDIA NIM.
+
+    Uses sequential batches (proven reliable on NVIDIA NIM free tier) with
+    transcript sectioning for diversity and deduplication for quality.
+
+    Args:
+        transcript: The full transcript text from the video.
+        video_id: YouTube video ID.
+        num_questions: Number of questions to generate (1-30).
+        difficulty: Quiz difficulty — "easy", "moderate", or "hard".
+        model: NVIDIA NIM model to use.
+        transcript_language: Language code of the transcript.
+
+    Returns:
+        A Quiz object with generated questions.
+    """
+    if not 1 <= num_questions <= 30:
+        raise ValueError("num_questions must be between 1 and 30")
+    if difficulty not in ("easy", "moderate", "hard"):
+        raise ValueError("difficulty must be 'easy', 'moderate', or 'hard'")
+
+    effective_batch = _batch_size_for(num_questions, difficulty)
+
+    if num_questions <= effective_batch:
+        # Single batch — generate all at once
+        return await asyncio.to_thread(
+            _generate_batch,
+            transcript=transcript,
+            video_id=video_id,
+            num_questions=num_questions,
+            difficulty=difficulty,
+            transcript_language=transcript_language,
+            model=model,
+            batch_offset=0,
+        )
+
+    # Multiple batches — generate in groups, then dedup
+    total_batches = (num_questions + effective_batch - 1) // effective_batch
+    sections = _split_transcript(transcript, total_batches)
+
+    all_questions: list[QuizQuestion] = []
+    title = None
+    remaining = num_questions
+
+    for batch_num in range(total_batches):
+        batch_count = min(effective_batch, remaining)
+        print(f"  Batch {batch_num + 1}/{total_batches}: generating {batch_count} questions...")
+
+        batch_quiz = await asyncio.to_thread(
+            _generate_batch,
+            transcript=transcript,
+            video_id=video_id,
+            num_questions=batch_count,
+            difficulty=difficulty,
+            transcript_language=transcript_language,
+            model=model,
+            batch_offset=batch_num * effective_batch,
+            transcript_section=sections[batch_num],
+        )
+
+        if title is None:
+            title = batch_quiz.title
+
+        all_questions.extend(batch_quiz.questions)
+        remaining -= batch_count
+
+    # Deduplicate questions — removes duplicates across batches
+    kept, removed = _deduplicate_questions(all_questions)
+
+    if removed:
+        logger.info(f"Dedup: removed {len(removed)} duplicate questions, {len(kept)} kept")
+
+    return Quiz(
+        title=title or f"Quiz: Video {video_id}",
+        video_id=video_id,
+        questions=kept[:num_questions],  # trim to requested count
+        language="en",
+    )
+
+
+# ─── Async wrapper for SSE endpoint ─────────────────────────────────────────
+
+async def _generate_batch_async(
+    transcript: str,
+    video_id: str,
+    num_questions: int,
+    difficulty: str,
+    transcript_language: Optional[str] = None,
+    model: Optional[str] = None,
+    batch_offset: int = 0,
+    exclude_topics: list[str] | None = None,
+    transcript_section: str | None = None,
+) -> Quiz:
+    """Async wrapper — runs _generate_batch in a thread."""
+    return await asyncio.to_thread(
+        _generate_batch,
+        transcript=transcript,
+        video_id=video_id,
+        num_questions=num_questions,
+        difficulty=difficulty,
+        transcript_language=transcript_language,
+        model=model,
+        batch_offset=batch_offset,
+        exclude_topics=exclude_topics,
+        transcript_section=transcript_section,
+    )
+
+
+async def close_client():
+    """No-op — we use requests, no async client to close."""
+    pass

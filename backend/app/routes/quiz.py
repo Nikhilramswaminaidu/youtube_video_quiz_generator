@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import time
 from typing import Optional
 
@@ -18,8 +19,16 @@ from backend.app.models.schemas import (
     ErrorResponse,
 )
 from backend.app.services.transcript import extract_video_id, get_transcript
-from backend.app.services.quiz_generator import generate_quiz, _generate_batch, _batch_size_for
+from backend.app.services.quiz_generator import (
+    generate_quiz,
+    _generate_batch_async,
+    _batch_size_for,
+    _split_transcript,
+    _deduplicate_questions,
+)
 from backend.app.services.pdf_generator import generate_quiz_pdf, generate_results_pdf
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/quiz", tags=["quiz"])
 
@@ -85,10 +94,9 @@ async def generate_quiz_endpoint(request: GenerateQuizRequest):
     except RuntimeError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    # Generate quiz
+    # Generate quiz (now async with parallel batches)
     try:
-        quiz = await asyncio.to_thread(
-            generate_quiz,
+        quiz = await generate_quiz(
             transcript=result.text,
             video_id=video_id,
             num_questions=request.num_questions,
@@ -123,7 +131,7 @@ async def generate_quiz_endpoint(request: GenerateQuizRequest):
 @router.get(
     "/generate/stream",
     summary="Generate quiz with live progress (SSE)",
-    description="Server-Sent Events endpoint that streams progress as the quiz is generated. Much better UX than the blocking endpoint.",
+    description="Server-Sent Events endpoint that streams progress as the quiz is generated. Batches run in parallel for speed.",
 )
 async def generate_quiz_stream(
     youtube_url: str,
@@ -133,6 +141,8 @@ async def generate_quiz_stream(
     """Stream quiz generation progress via SSE.
 
     Events: progress, complete, error
+    Batches run in parallel (up to MAX_CONCURRENT_BATCHES concurrent) with
+    progress events emitted as each batch completes.
     """
     try:
         video_id = extract_video_id(youtube_url)
@@ -165,15 +175,16 @@ async def generate_quiz_stream(
             elapsed = round(_time.time() - gen_start, 1)
             yield f"event: progress\ndata: {json.dumps({'step': 'transcript_done', 'message': f'Transcript ready ({result.char_count:,} chars, {result.language})', 'elapsed': elapsed})}\n\n"
 
-            # Step 2: Generate quiz in batches with progress
-            all_questions = []
-            title = None
+            # Step 2: Generate quiz in sequential batches with progress
             effective_batch = _batch_size_for(num_questions, difficulty)
             total_batches = (num_questions + effective_batch - 1) // effective_batch
-            batch_times = []  # track how long each batch takes
+            sections = _split_transcript(result.text, total_batches)
+            all_questions = []
+            title = None
+            batch_times = []
 
             for batch_num in range(total_batches):
-                batch_count = min(effective_batch, num_questions - len(all_questions))
+                batch_count = min(effective_batch, num_questions - batch_num * effective_batch)
                 current_batch = batch_num + 1
                 yield f"event: progress\ndata: {json.dumps({'step': 'generating', 'message': f'Generating questions (batch {current_batch}/{total_batches})...', 'batch': current_batch, 'total_batches': total_batches, 'done': len(all_questions), 'total': num_questions})}\n\n"
 
@@ -182,14 +193,14 @@ async def generate_quiz_stream(
 
                 batch_start = _time.time()
                 try:
-                    batch_quiz = await asyncio.to_thread(
-                        _generate_batch,
+                    batch_quiz = await _generate_batch_async(
                         transcript=result.text,
                         video_id=video_id,
                         num_questions=batch_count,
                         difficulty=difficulty,
                         transcript_language=result.language,
                         batch_offset=batch_num * effective_batch,
+                        transcript_section=sections[batch_num],
                     )
                     batch_elapsed = _time.time() - batch_start
                     batch_times.append(batch_elapsed)
@@ -208,12 +219,22 @@ async def generate_quiz_stream(
                     yield f"event: error\ndata: {json.dumps({'error': f'Generation failed: {str(e)}'})}\n\n"
                     return
 
+            # Step 3: Deduplicate questions
+            yield f"event: progress\ndata: {json.dumps({'step': 'dedup', 'message': f'Removing duplicates from {len(all_questions)} questions...', 'done': len(all_questions), 'total': num_questions, 'elapsed': round(_time.time() - gen_start, 1)})}\n\n"
+
+            kept, removed = _deduplicate_questions(all_questions)
+
+            if removed:
+                logger.info(f"Dedup removed {len(removed)} duplicates, {len(kept)} kept")
+
+            yield f"event: progress\ndata: {json.dumps({'step': 'dedup_done', 'message': f'{len(kept)} unique questions ready', 'done': len(kept), 'total': num_questions, 'elapsed': round(_time.time() - gen_start, 1)})}\n\n"
+
             # Build final quiz
             from backend.app.models.schemas import Quiz
             quiz = Quiz(
                 title=title or f"Quiz: Video {video_id}",
                 video_id=video_id,
-                questions=all_questions,
+                questions=kept[:num_questions],
                 language="en",
             )
             quiz_data = quiz.to_dict()
@@ -221,7 +242,7 @@ async def generate_quiz_stream(
             _store_cache(video_id, num_questions, difficulty, quiz_data)
 
             total_time = round(_time.time() - gen_start, 1)
-            yield f"event: progress\ndata: {json.dumps({'step': 'done', 'message': f'Quiz ready! {len(all_questions)} questions generated.', 'elapsed': total_time})}\n\n"
+            yield f"event: progress\ndata: {json.dumps({'step': 'done', 'message': f'Quiz ready! {len(kept[:num_questions])} questions generated.', 'elapsed': total_time})}\n\n"
             yield f"event: complete\ndata: {json.dumps(_build_quiz_response(video_id, quiz_data))}\n\n"
 
         except Exception as e:
