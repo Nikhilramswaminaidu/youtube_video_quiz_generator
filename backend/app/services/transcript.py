@@ -133,89 +133,80 @@ def get_transcript(
     Raises:
         RuntimeError: If transcripts are disabled, not found, or video unavailable.
     """
+    target_lang = (languages or ["en"])[0].split("-")[0]
+
+    # Strategy: try youtube-transcript-api first, fall back to yt-dlp on ANY failure.
+    # Cloud IPs (AWS, GCP, Azure, Render) get blocked by YouTube, so the API
+    # call can fail in many ways — always attempt yt-dlp as a fallback.
+    try:
+        result = _fetch_via_transcript_api(video_id, languages, auto_detect)
+        if result:
+            return result
+    except (TranscriptsDisabled, VideoUnavailable) as e:
+        # These are video-level problems (no captions, private video) —
+        # yt-dlp won't help either, so raise immediately.
+        raise RuntimeError(str(e))
+    except Exception as e:
+        # IP blocks, rate limits, unexpected errors — try yt-dlp
+        logger.warning(
+            f"youtube-transcript-api failed for {video_id}: {type(e).__name__}: {e}. "
+            "Falling back to yt-dlp."
+        )
+
+    # yt-dlp fallback (works from cloud IPs because it downloads subtitle files directly)
+    logger.info(f"Trying yt-dlp fallback for {video_id}")
+    ytdlp_result = _fetch_transcript_ytdlp(video_id, target_lang)
+    if ytdlp_result:
+        return ytdlp_result
+
+    # Both methods failed
+    raise RuntimeError(
+        f"Could not retrieve transcript for video {video_id}. "
+        "YouTube may be blocking requests from this server's IP address. "
+        "Try again later or use a video with manually uploaded captions."
+    )
+
+
+def _fetch_via_transcript_api(
+    video_id: str,
+    languages: Optional[list[str]] = None,
+    auto_detect: bool = True,
+) -> Optional[TranscriptResult]:
+    """Try fetching transcript using youtube-transcript-api.
+
+    Returns a TranscriptResult on success, or raises on failure.
+    Caller should catch exceptions and fall back to yt-dlp.
+    """
     api = YouTubeTranscriptApi()
 
+    transcript_list = api.list(video_id)
+
+    # If no specific language requested, auto-detect the best one
+    if languages is None and auto_detect:
+        languages = _build_language_preference(transcript_list)
+
+    if languages is None:
+        languages = ["en", "en-US", "en-GB"]
+
     try:
-        transcript_list = api.list(video_id)
-
-        # If no specific language requested, auto-detect the best one
-        if languages is None and auto_detect:
-            languages = _build_language_preference(transcript_list)
-
-        if languages is None:
-            languages = ["en", "en-US", "en-GB"]
-
-        try:
-            # Prefer manually created captions (higher quality)
-            transcript = transcript_list.find_manually_created_transcript(languages)
-            is_auto = False
-        except NoTranscriptFound:
-            # Fall back to generated captions (auto-generated)
-            transcript = transcript_list.find_generated_transcript(languages)
-            is_auto = True
-
-        fetched = transcript.fetch()
-        # fetched.snippets is a list of FetchedTranscriptSnippet objects
-        # Each has .text, .start, .duration
-        text = " ".join(snippet.text for snippet in fetched.snippets)
-        lang = fetched.language_code
-
-        return TranscriptResult(
-            video_id=video_id,
-            text=text,
-            language=lang,
-            is_auto_generated=is_auto,
-        )
-
+        # Prefer manually created captions (higher quality)
+        transcript = transcript_list.find_manually_created_transcript(languages)
+        is_auto = False
     except NoTranscriptFound:
-        # Direct captions not found in requested language.
-        # Try translating from an available caption.
-        target_lang = languages[0] if languages else "en"
-        translated = _try_translate(transcript_list, target_lang, video_id)
-        if translated:
-            return translated
+        # Fall back to generated captions (auto-generated)
+        transcript = transcript_list.find_generated_transcript(languages)
+        is_auto = True
 
-        # youtube-transcript-api didn't work — fall back to yt-dlp
-        logger.info(f"youtube-transcript-api: no transcript found for {video_id}, trying yt-dlp fallback")
-        ytdlp_result = _fetch_transcript_ytdlp(video_id, target_lang.split("-")[0])
-        if ytdlp_result:
-            return ytdlp_result
+    fetched = transcript.fetch()
+    text = " ".join(snippet.text for snippet in fetched.snippets)
+    lang = fetched.language_code
 
-        # No direct captions and translation didn't work
-        available = _format_available_languages(transcript_list)
-        raise RuntimeError(
-            f"No transcript found for video {video_id} in language: {target_lang}.\n"
-            f"Available direct captions:\n{available}\n\n"
-            "Tip: This video may have translation support (shown as 'translatable'). "
-            "Translation works from a home internet connection but may be blocked "
-            "from cloud/datacenter IPs.\n\n"
-            "Alternatively, use the English transcript (auto-detected by default) "
-            "and the quiz will still be generated in English."
-        )
-
-    except TranscriptsDisabled:
-        raise RuntimeError(
-            f"Transcripts are disabled for video {video_id}. "
-            "The video owner has not made captions available."
-        )
-    except VideoUnavailable:
-        raise RuntimeError(
-            f"Video {video_id} is unavailable. "
-            "It may be private, age-restricted, or deleted."
-        )
-    except Exception as e:
-        # Catch IP block errors and other unexpected failures — fall back to yt-dlp
-        if _is_ip_blocked_error(e):
-            logger.warning(
-                f"youtube-transcript-api blocked for {video_id}: {e}. "
-                "Falling back to yt-dlp."
-            )
-            target_lang = (languages[0] if languages else "en").split("-")[0]
-            ytdlp_result = _fetch_transcript_ytdlp(video_id, target_lang)
-            if ytdlp_result:
-                return ytdlp_result
-
-        raise
+    return TranscriptResult(
+        video_id=video_id,
+        text=text,
+        language=lang,
+        is_auto_generated=is_auto,
+    )
 
 
 def _try_translate(transcript_list, target_lang: str, video_id: str) -> Optional[TranscriptResult]:
@@ -295,12 +286,15 @@ def _fetch_transcript_ytdlp(video_id: str, language: str = "en") -> Optional[Tra
     # --write-subs --write-auto-subs ensures both manual and auto captions are considered
     # --skip-download avoids downloading the video itself
     # -j dumps video info JSON including available subtitles
+    # --no-check-certificates and User-Agent help bypass cloud IP restrictions
     cmd = [
         "yt-dlp",
         "--skip-download",
         "--write-subs",
         "--write-auto-subs",
         "--sub-langs", f"{language},{language[:2]},en,en-US,en-GB",
+        "--no-check-certificates",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "--output", "-",  # output to stdout
         "--print", "requested_subtitles",  # print subtitle URLs
         "-j",  # dump full video info as JSON
@@ -426,6 +420,8 @@ def _fetch_transcript_ytdlp_direct(video_id: str, language: str = "en") -> Optio
                 *auto_flag,
                 "--sub-langs", f"{base_lang},en",
                 "--convert-subs", "srt",  # Convert to SRT for easy parsing
+                "--no-check-certificates",
+                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                 "-o", os.path.join(tmpdir, "sub"),
                 url,
             ]
