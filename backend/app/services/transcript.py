@@ -8,6 +8,7 @@ from typing import Optional
 
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
+    CouldNotRetrieveTranscript,
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
@@ -71,7 +72,7 @@ def list_available_languages(video_id: str) -> list[dict]:
         A list of dicts with keys: language_code, language, is_generated, is_translatable.
 
     Raises:
-        RuntimeError: If transcripts are disabled or video is unavailable.
+        RuntimeError: If transcripts are disabled, video is unavailable, or IP blocked.
     """
     api = YouTubeTranscriptApi()
 
@@ -86,6 +87,12 @@ def list_available_languages(video_id: str) -> list[dict]:
         raise RuntimeError(
             f"Video {video_id} is unavailable. "
             "It may be private, age-restricted, or deleted."
+        )
+    except CouldNotRetrieveTranscript as e:
+        # IP blocks, rate limits, etc. — re-raise as RuntimeError for the API layer
+        raise RuntimeError(
+            f"Could not list languages for video {video_id}: {type(e).__name__}: {e}. "
+            "YouTube may be blocking requests from this server's IP."
         )
 
     languages = []
@@ -138,6 +145,7 @@ def get_transcript(
     # Strategy: try youtube-transcript-api first, fall back to yt-dlp on ANY failure.
     # Cloud IPs (AWS, GCP, Azure, Render) get blocked by YouTube, so the API
     # call can fail in many ways — always attempt yt-dlp as a fallback.
+    api_error = None
     try:
         result = _fetch_via_transcript_api(video_id, languages, auto_detect)
         if result:
@@ -146,8 +154,17 @@ def get_transcript(
         # These are video-level problems (no captions, private video) —
         # yt-dlp won't help either, so raise immediately.
         raise RuntimeError(str(e))
+    except CouldNotRetrieveTranscript as e:
+        # Parent class catches IpBlocked, RequestBlocked, and any other
+        # youtube-transcript-api errors that aren't video-level problems.
+        api_error = e
+        logger.warning(
+            f"youtube-transcript-api failed for {video_id}: {type(e).__name__}: {e}. "
+            "Falling back to yt-dlp."
+        )
     except Exception as e:
-        # IP blocks, rate limits, unexpected errors — try yt-dlp
+        # Any other unexpected error — try yt-dlp
+        api_error = e
         logger.warning(
             f"youtube-transcript-api failed for {video_id}: {type(e).__name__}: {e}. "
             "Falling back to yt-dlp."
@@ -159,9 +176,11 @@ def get_transcript(
     if ytdlp_result:
         return ytdlp_result
 
-    # Both methods failed
+    # Both methods failed — give a clear error message
+    api_error_msg = f" youtube-transcript-api error: {type(api_error).__name__}" if api_error else ""
     raise RuntimeError(
         f"Could not retrieve transcript for video {video_id}. "
+        f"Both youtube-transcript-api and yt-dlp failed.{api_error_msg} "
         "YouTube may be blocking requests from this server's IP address. "
         "Try again later or use a video with manually uploaded captions."
     )
@@ -509,21 +528,6 @@ def _parse_subtitle_content(content: str) -> str:
             text_parts.append(clean)
 
     return " ".join(text_parts)
-
-
-def _is_ip_blocked_error(error: Exception) -> bool:
-    """Check if an error is likely caused by YouTube blocking cloud/datacenter IPs."""
-    err_type = type(error).__name__
-    err_msg = str(error).lower()
-    # Specific error patterns from youtube-transcript-api on cloud IPs
-    return (
-        "ipblocked" in err_type.lower()
-        or "ipblockedexception" in err_type.lower()
-        or "blocked" in err_msg and "transcript" in err_msg
-        or "access denied" in err_msg
-        or "not allowed" in err_msg
-        or "request was rejected" in err_msg
-    )
 
 
 def _build_language_preference(transcript_list) -> list[str]:

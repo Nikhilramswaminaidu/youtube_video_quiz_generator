@@ -1,15 +1,19 @@
 """FastAPI application for the YouTube Quiz Generator."""
 
+import logging
 import os
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 
 from backend.app.routes.quiz import router as quiz_router
 from backend.app.routes.video import router as video_router
+
+logger = logging.getLogger(__name__)
 
 # Path to the frontend directory
 FRONTEND_DIR = Path(__file__).parent.parent.parent / "frontend"
@@ -49,6 +53,50 @@ app.add_middleware(
 # Register API routes FIRST (before catch-all frontend route)
 app.include_router(quiz_router)
 app.include_router(video_router)
+
+
+# Health check endpoint for debugging on cloud deployments
+@app.get("/api/health", tags=["system"])
+async def health_check():
+    """Health check — shows yt-dlp availability, library versions, and commit hash.
+
+    Useful for debugging transcript issues on cloud deployments (Render, etc.).
+    """
+    health = {"status": "ok"}
+
+    # Check yt-dlp availability
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        health["yt_dlp"] = {
+            "available": True,
+            "version": result.stdout.strip() or result.stderr.strip(),
+        }
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        health["yt_dlp"] = {"available": False, "error": str(e)}
+
+    # Check youtube-transcript-api version
+    try:
+        import youtube_transcript_api
+        health["youtube_transcript_api_version"] = getattr(
+            youtube_transcript_api, "__version__", "unknown"
+        )
+    except ImportError:
+        health["youtube_transcript_api_version"] = "not installed"
+
+    # Git commit (if available)
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        health["git_commit"] = result.stdout.strip() or "unknown"
+    except Exception:
+        health["git_commit"] = "unknown"
+
+    return JSONResponse(health)
 
 
 # Serve the frontend HTML

@@ -91,7 +91,8 @@ async def generate_quiz_endpoint(request: GenerateQuizRequest):
     # Fetch transcript
     try:
         result = await asyncio.to_thread(get_transcript, video_id)
-    except RuntimeError as e:
+    except Exception as e:
+        logger.error(f"Transcript fetch failed for {video_id}: {type(e).__name__}: {e}")
         raise HTTPException(status_code=404, detail=str(e))
 
     # Generate quiz (now async with parallel batches)
@@ -168,7 +169,9 @@ async def generate_quiz_stream(
             yield f"event: progress\ndata: {json.dumps({'step': 'transcript', 'message': 'Fetching video transcript...'})}\n\n"
             try:
                 result = await asyncio.to_thread(get_transcript, video_id)
-            except RuntimeError as e:
+            except Exception as e:
+                # Catch ALL exceptions — youtube-transcript-api errors, RuntimeError, etc.
+                logger.error(f"Transcript fetch failed for {video_id}: {type(e).__name__}: {e}")
                 yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
                 return
 
