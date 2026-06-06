@@ -142,28 +142,23 @@ def get_transcript(
     """
     target_lang = (languages or ["en"])[0].split("-")[0]
 
-    # Strategy: try youtube-transcript-api first, fall back to yt-dlp on ANY failure.
-    # Cloud IPs (AWS, GCP, Azure, Render) get blocked by YouTube, so the API
-    # call can fail in many ways — always attempt yt-dlp as a fallback.
+    # Strategy: try youtube-transcript-api first, then fall back to yt-dlp.
+    # Cloud IPs (AWS, GCP, Azure, Render) get blocked by YouTube in unpredictable
+    # ways — the API may raise VideoUnavailable, RequestBlocked, IpBlocked, etc.
+    # Only TranscriptsDisabled is truly terminal (video owner disabled captions).
+    # Everything else gets a yt-dlp fallback attempt.
     api_error = None
     try:
         result = _fetch_via_transcript_api(video_id, languages, auto_detect)
         if result:
             return result
-    except (TranscriptsDisabled, VideoUnavailable) as e:
-        # These are video-level problems (no captions, private video) —
-        # yt-dlp won't help either, so raise immediately.
+    except TranscriptsDisabled as e:
+        # Video owner disabled captions — no method can retrieve them.
         raise RuntimeError(str(e))
-    except CouldNotRetrieveTranscript as e:
-        # Parent class catches IpBlocked, RequestBlocked, and any other
-        # youtube-transcript-api errors that aren't video-level problems.
-        api_error = e
-        logger.warning(
-            f"youtube-transcript-api failed for {video_id}: {type(e).__name__}: {e}. "
-            "Falling back to yt-dlp."
-        )
     except Exception as e:
-        # Any other unexpected error — try yt-dlp
+        # VideoUnavailable, IpBlocked, RequestBlocked, or any other error —
+        # try yt-dlp (it uses a different access method and often works on cloud IPs
+        # where the Python library gets blocked, even for videos the API says are "unavailable")
         api_error = e
         logger.warning(
             f"youtube-transcript-api failed for {video_id}: {type(e).__name__}: {e}. "
