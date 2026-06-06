@@ -6,6 +6,13 @@ import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# Configure logging so INFO/WARNING messages appear on Render (default level is WARNING)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
