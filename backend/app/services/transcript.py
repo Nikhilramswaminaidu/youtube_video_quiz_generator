@@ -176,8 +176,12 @@ def get_transcript(
     if ytdlp_result:
         return ytdlp_result
 
-    # Both methods failed — give a clear error message
+    # All methods failed — give a clear error message
     api_error_msg = f" youtube-transcript-api error: {type(api_error).__name__}" if api_error else ""
+    logger.error(
+        f"All transcript methods failed for {video_id}."
+        f"{api_error_msg} yt-dlp also returned no results."
+    )
     raise RuntimeError(
         f"Could not retrieve transcript for video {video_id}. "
         f"Both youtube-transcript-api and yt-dlp failed.{api_error_msg} "
@@ -329,7 +333,8 @@ def _fetch_transcript_ytdlp(video_id: str, language: str = "en") -> Optional[Tra
         )
 
         if result.returncode != 0:
-            logger.warning(f"yt-dlp returned non-zero exit code: {result.stderr[:500]}")
+            stderr_preview = result.stderr[:500] if result.stderr else "(no stderr)"
+            logger.warning(f"yt-dlp returned non-zero exit code {result.returncode}: {stderr_preview}")
             # Try alternative approach: download subtitle file directly
             return _fetch_transcript_ytdlp_direct(video_id, language)
 
@@ -429,6 +434,7 @@ def _fetch_transcript_ytdlp_direct(video_id: str, language: str = "en") -> Optio
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     base_lang = language.split("-")[0]
+    logger.info(f"yt-dlp direct fallback: downloading subtitle file for {video_id}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Try manual subs first, then auto subs
