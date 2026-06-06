@@ -1,0 +1,38 @@
+# ── Version control ──
+.git
+.gitignore
+
+# ── Python virtualenv / cache ──
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── Environment / secrets ──
+.env
+.env.local
+.env.production
+
+# ── IDE / OS ──
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Test / scratch files ──
+quiz_*.json
+test_*.py
+
+# ── Deployment configs (not needed inside container) ──
+render.yaml
+Procfile
+README.md
+claude/
+.claude/
