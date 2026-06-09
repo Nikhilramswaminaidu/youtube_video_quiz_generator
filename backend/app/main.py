@@ -93,6 +93,12 @@ async def health_check():
     except ImportError:
         health["youtube_transcript_api_version"] = "not installed"
 
+    # Show transcript fallback config
+    import os
+    health["youtube_proxy_url"] = "configured" if os.environ.get("YOUTUBE_PROXY_URL") else "not set"
+    from backend.app.services.transcript import INVIDIOUS_INSTANCES
+    health["invidious_instances"] = INVIDIOUS_INSTANCES
+
     # Git commit (if available)
     try:
         result = subprocess.run(

@@ -1,11 +1,20 @@
-"""YouTube transcript extraction service."""
+"""YouTube transcript extraction service.
+
+Uses a multi-strategy approach to fetch transcripts:
+1. youtube-transcript-api (works locally, often blocked on cloud IPs)
+2. Cloudflare Worker proxy (if configured, routes through CDN edge IPs)
+3. Invidious instances (public YouTube proxies, bypass cloud IP blocking)
+4. yt-dlp fallback (works from some IPs)
+"""
 
 import json
 import logging
+import os
 import re
 import subprocess
 from typing import Optional
 
+import httpx
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     CouldNotRetrieveTranscript,
@@ -17,6 +26,76 @@ from youtube_transcript_api._errors import (
 from backend.app.models.schemas import TranscriptResult
 
 logger = logging.getLogger(__name__)
+
+# Invidious instances are public YouTube proxies, but most have disabled their API.
+# We try them as a fallback, but the primary cloud-deployment solution is the
+# Cloudflare Worker proxy (YOUTUBE_PROXY_URL env var).
+# Override via INVIDIOUS_INSTANCES env var (comma-separated URLs).
+_DEFAULT_INVIDIOUS_INSTANCES = [
+    "https://inv.thepixora.com",
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://iv.ggtyler.dev",
+]
+
+INVIDIOUS_INSTANCES = [
+    url.strip().rstrip("/")
+    for url in os.environ.get("INVIDIOUS_INSTANCES", "").split(",")
+    if url.strip()
+] or _DEFAULT_INVIDIOUS_INSTANCES
+
+# Cache for dynamically discovered Invidious instances (refreshed periodically)
+_discovered_instances: list[str] = []
+_discovery_timestamp: float = 0
+
+
+def _get_invidious_instances() -> list[str]:
+    """Get Invidious instances, including dynamically discovered ones.
+
+    Merges hardcoded defaults with instances discovered from the public registry.
+    Discovery results are cached for 1 hour to avoid repeated lookups.
+    """
+    global _discovered_instances, _discovery_timestamp
+
+    # Use cache if fresh (< 1 hour old)
+    import time
+    now = time.time()
+    if _discovered_instances and (now - _discovery_timestamp) < 3600:
+        return INVIDIOUS_INSTANCES + [i for i in _discovered_instances if i not in INVIDIOUS_INSTANCES]
+
+    # Try to discover instances from the public registry
+    try:
+        import time as _time
+        with httpx.Client(timeout=10, follow_redirects=True) as client:
+            response = client.get("https://api.invidious.io/instances.json")
+            if response.status_code == 200:
+                instances_data = response.json()
+                discovered = []
+                for instance in instances_data:
+                    # Each entry is [url, stats]
+                    if not isinstance(instance, list) or len(instance) < 2:
+                        continue
+                    url = instance[0]
+                    stats = instance[1] if isinstance(instance[1], dict) else {}
+
+                    # Only include instances with API enabled and not flagged down
+                    if not stats.get("api"):
+                        continue
+                    if stats.get("monitor", {}).get("down", True):
+                        continue
+
+                    clean_url = url.rstrip("/")
+                    if clean_url not in INVIDIOUS_INSTANCES and clean_url not in discovered:
+                        discovered.append(clean_url)
+
+                if discovered:
+                    _discovered_instances = discovered
+                    _discovery_timestamp = now
+                    logger.info(f"Discovered {len(discovered)} Invidious instances from registry")
+    except Exception as e:
+        logger.debug(f"Invidious instance discovery failed: {e}")
+
+    return INVIDIOUS_INSTANCES + [i for i in _discovered_instances if i not in INVIDIOUS_INSTANCES]
 
 
 # Regex patterns for extracting video IDs from various YT URL formats
@@ -119,8 +198,11 @@ def get_transcript(
 ) -> TranscriptResult:
     """Fetch transcript for a YouTube video.
 
-    Uses the youtube-transcript-api v1.x API (instance-based) first,
-    then falls back to yt-dlp if blocked by cloud/datacenter IP restrictions.
+    Uses a multi-strategy fallback approach:
+    1. youtube-transcript-api (works locally, often blocked on cloud IPs)
+    2. Cloudflare Worker proxy (if YOUTUBE_PROXY_URL is set)
+    3. Invidious instances (public YouTube proxies, bypass IP blocking)
+    4. yt-dlp fallback (works from some IPs)
 
     Prefers manually created captions over auto-generated ones.
     Supports YouTube's built-in translation for languages that don't have
@@ -142,11 +224,8 @@ def get_transcript(
     """
     target_lang = (languages or ["en"])[0].split("-")[0]
 
-    # Strategy: try youtube-transcript-api first, then fall back to yt-dlp.
-    # Cloud IPs (AWS, GCP, Azure, Render) get blocked by YouTube in unpredictable
-    # ways — the API may raise VideoUnavailable, RequestBlocked, IpBlocked, etc.
     # Only TranscriptsDisabled is truly terminal (video owner disabled captions).
-    # Everything else gets a yt-dlp fallback attempt.
+    # Everything else gets fallback attempts.
     api_error = None
     try:
         result = _fetch_via_transcript_api(video_id, languages, auto_detect)
@@ -156,30 +235,38 @@ def get_transcript(
         # Video owner disabled captions — no method can retrieve them.
         raise RuntimeError(str(e))
     except Exception as e:
-        # VideoUnavailable, IpBlocked, RequestBlocked, or any other error —
-        # try yt-dlp (it uses a different access method and often works on cloud IPs
-        # where the Python library gets blocked, even for videos the API says are "unavailable")
         api_error = e
         logger.warning(
             f"youtube-transcript-api failed for {video_id}: {type(e).__name__}: {e}. "
-            "Falling back to yt-dlp."
+            "Trying fallbacks."
         )
 
-    # yt-dlp fallback (works from cloud IPs because it downloads subtitle files directly)
+    # Cloudflare Worker proxy (if configured)
+    worker_url = os.environ.get("YOUTUBE_PROXY_URL")
+    if worker_url:
+        logger.info(f"Trying Cloudflare Worker proxy for {video_id}")
+        worker_result = _fetch_via_worker_proxy(video_id, target_lang, worker_url)
+        if worker_result:
+            return worker_result
+
+    # Invidious instances (public YouTube proxies — bypass cloud IP blocking for free)
+    logger.info(f"Trying Invidious fallback for {video_id}")
+    invidious_result = _fetch_via_invidious(video_id, target_lang)
+    if invidious_result:
+        return invidious_result
+
+    # yt-dlp fallback (works from some IPs)
     logger.info(f"Trying yt-dlp fallback for {video_id}")
     ytdlp_result = _fetch_transcript_ytdlp(video_id, target_lang)
     if ytdlp_result:
         return ytdlp_result
 
     # All methods failed — give a clear error message
-    api_error_msg = f" youtube-transcript-api error: {type(api_error).__name__}" if api_error else ""
-    logger.error(
-        f"All transcript methods failed for {video_id}."
-        f"{api_error_msg} yt-dlp also returned no results."
-    )
+    api_error_msg = f" youtube-transcript-api: {type(api_error).__name__}" if api_error else ""
+    logger.error(f"All transcript methods failed for {video_id}.{api_error_msg}")
     raise RuntimeError(
         f"Could not retrieve transcript for video {video_id}. "
-        f"Both youtube-transcript-api and yt-dlp failed.{api_error_msg} "
+        f"All methods failed (youtube-transcript-api, Invidious, yt-dlp).{api_error_msg} "
         "YouTube may be blocking requests from this server's IP address. "
         "Try again later or use a video with manually uploaded captions."
     )
@@ -225,6 +312,190 @@ def _fetch_via_transcript_api(
         language=lang,
         is_auto_generated=is_auto,
     )
+
+
+def _fetch_via_invidious(
+    video_id: str,
+    language: str = "en",
+) -> Optional[TranscriptResult]:
+    """Fetch transcript via Invidious instances (public YouTube proxies).
+
+    Invidious instances proxy YouTube content and serve captions from their own
+    servers, bypassing YouTube's IP blocking of cloud/datacenter IPs.
+    Note: Many public instances have disabled their API, so this fallback is
+    unreliable. For cloud deployments, use the Cloudflare Worker proxy instead.
+
+    Tries multiple instances (including dynamically discovered ones); returns on
+    first success.
+    """
+    base_lang = language.split("-")[0]
+    instances = _get_invidious_instances()
+
+    for instance in instances:
+        try:
+            # Use the direct lang param to get caption content in one request
+            # (avoids a separate list-then-fetch round-trip that often times out)
+            captions_url = f"{instance}/api/v1/captions/{video_id}?lang={base_lang}"
+            with httpx.Client(timeout=15, follow_redirects=True) as client:
+                response = client.get(captions_url)
+                if response.status_code != 200:
+                    logger.debug(
+                        f"Invidious {instance}: returned {response.status_code}"
+                    )
+                    continue
+
+                content_type = response.headers.get("content-type", "")
+
+                # Check if we got JSON (caption list) or caption content (VTT/XML)
+                if "json" in content_type:
+                    # Got a caption list — find the best track and fetch its content
+                    data = response.json()
+                    captions = data.get("captions", [])
+                    if not captions:
+                        logger.debug(f"Invidious {instance}: no captions in list")
+                        continue
+
+                    best = _pick_best_invidious_caption(captions, base_lang)
+                    if not best:
+                        continue
+
+                    cap_url = best.get("url", best.get("url_vtt", ""))
+                    if not cap_url:
+                        label = best.get("label", best.get("name", ""))
+                        cap_url = f"/api/v1/captions/{video_id}?label={label}&lang={best.get('languageCode', base_lang)}"
+                    if not cap_url.startswith("http"):
+                        cap_url = f"{instance}{cap_url}"
+
+                    cap_response = client.get(cap_url, timeout=20)
+                    if cap_response.status_code != 200:
+                        logger.debug(
+                            f"Invidious {instance}: caption content returned {cap_response.status_code}"
+                        )
+                        continue
+
+                    text = _parse_subtitle_content(cap_response.text)
+                    if text and len(text.strip()) >= 20:
+                        logger.info(f"Invidious {instance}: fetched transcript for {video_id}")
+                        return TranscriptResult(
+                            video_id=video_id,
+                            text=text,
+                            language=best.get("languageCode", language),
+                            is_auto_generated=_is_auto_caption(best),
+                        )
+
+                else:
+                    # Got caption content directly (VTT, XML, or plain text)
+                    text = _parse_subtitle_content(response.text)
+                    if text and len(text.strip()) >= 20:
+                        logger.info(f"Invidious {instance}: fetched transcript for {video_id}")
+                        return TranscriptResult(
+                            video_id=video_id,
+                            text=text,
+                            language=base_lang,
+                            is_auto_generated=True,
+                        )
+
+                logger.debug(f"Invidious {instance}: content empty or too short, trying next")
+
+        except httpx.TimeoutException:
+            logger.debug(f"Invidious {instance}: timed out")
+            continue
+        except Exception as e:
+            logger.debug(f"Invidious {instance}: {type(e).__name__}: {e}")
+            continue
+
+    logger.warning(f"All Invidious instances failed for {video_id}")
+    return None
+
+
+def _pick_best_invidious_caption(captions: list[dict], target_lang: str) -> Optional[dict]:
+    """Select the best Invidious caption track for the target language.
+
+    Preference order:
+    1. Manual (non-auto) captions in the target language
+    2. Auto-generated captions in the target language
+    3. Manual English captions
+    4. Auto-generated English captions
+    5. First available caption track
+    """
+    lang_matches_manual = []
+    lang_matches_auto = []
+    en_manual = []
+    en_auto = []
+
+    for cap in captions:
+        code = cap.get("languageCode", "")
+        label = (cap.get("label") or cap.get("name", "")).lower()
+        is_auto = "auto" in label or "generated" in label or cap.get("kind") == "asr"
+
+        if code.startswith(target_lang):
+            (lang_matches_auto if is_auto else lang_matches_manual).append(cap)
+        elif code.startswith("en"):
+            (en_auto if is_auto else en_manual).append(cap)
+
+    # Return best match in priority order
+    for pool in [lang_matches_manual, lang_matches_auto, en_manual, en_auto]:
+        if pool:
+            return pool[0]
+
+    # Last resort: any available caption
+    return captions[0] if captions else None
+
+
+def _is_auto_caption(caption: dict) -> bool:
+    """Check if an Invidious caption track is auto-generated."""
+    label = (caption.get("label") or caption.get("name", "")).lower()
+    return "auto" in label or "generated" in label or caption.get("kind") == "asr"
+
+
+def _fetch_via_worker_proxy(
+    video_id: str,
+    language: str,
+    proxy_url: str,
+) -> Optional[TranscriptResult]:
+    """Fetch transcript via a Cloudflare Worker proxy.
+
+    A Cloudflare Worker deployed on Cloudflare's edge network can fetch YouTube
+    captions without being IP-blocked, since Cloudflare's edge IPs are CDN nodes
+    rather than traditional datacenter IPs. Free tier: 100,000 requests/day.
+
+    Set the YOUTUBE_PROXY_URL env var to your Worker's URL to enable this.
+    The Worker should accept ?v=VIDEO_ID&lang=LANG&fmt=srv1 and proxy
+    YouTube's timedtext API.
+
+    See cloudflare-worker.js for the Worker script.
+    """
+    params = {
+        "v": video_id,
+        "lang": language,
+        "fmt": "srv1",
+    }
+
+    try:
+        with httpx.Client(timeout=30, follow_redirects=True) as client:
+            response = client.get(proxy_url, params=params)
+            if response.status_code != 200:
+                logger.warning(
+                    f"Worker proxy returned {response.status_code} for {video_id}"
+                )
+                return None
+
+            text = _parse_subtitle_content(response.text)
+            if text and len(text.strip()) >= 20:
+                logger.info(f"Worker proxy: successfully fetched transcript for {video_id}")
+                return TranscriptResult(
+                    video_id=video_id,
+                    text=text,
+                    language=language,
+                    is_auto_generated=True,  # Can't determine from timedtext API
+                )
+
+            logger.warning(f"Worker proxy: parsed text too short for {video_id}")
+            return None
+
+    except Exception as e:
+        logger.warning(f"Worker proxy failed for {video_id}: {type(e).__name__}: {e}")
+        return None
 
 
 def _try_translate(transcript_list, target_lang: str, video_id: str) -> Optional[TranscriptResult]:
