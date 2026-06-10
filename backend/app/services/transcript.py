@@ -141,6 +141,10 @@ def extract_video_id(url: str) -> str:
 def list_available_languages(video_id: str) -> list[dict]:
     """List all available transcript languages for a YouTube video.
 
+    Uses youtube-transcript-api first, then falls back to Invidious instances
+    and the Cloudflare Worker proxy when the primary API is blocked (common on
+    cloud/datacenter IPs like Render).
+
     Includes both directly available captions and translatable languages.
     Direct captions are higher quality than translations.
 
@@ -151,9 +155,11 @@ def list_available_languages(video_id: str) -> list[dict]:
         A list of dicts with keys: language_code, language, is_generated, is_translatable.
 
     Raises:
-        RuntimeError: If transcripts are disabled, video is unavailable, or IP blocked.
+        RuntimeError: If transcripts are disabled, video is unavailable, or all methods fail.
     """
+    # Strategy 1: youtube-transcript-api (works locally, blocked on cloud IPs)
     api = YouTubeTranscriptApi()
+    api_error = None
 
     try:
         transcript_list = api.list(video_id)
@@ -168,27 +174,161 @@ def list_available_languages(video_id: str) -> list[dict]:
             "It may be private, age-restricted, or deleted."
         )
     except CouldNotRetrieveTranscript as e:
-        # IP blocks, rate limits, etc. — re-raise as RuntimeError for the API layer
-        raise RuntimeError(
-            f"Could not list languages for video {video_id}: {type(e).__name__}: {e}. "
-            "YouTube may be blocking requests from this server's IP."
+        # IP blocks, rate limits, etc. — try fallbacks
+        api_error = e
+        logger.warning(
+            f"youtube-transcript-api list failed for {video_id}: {type(e).__name__}: {e}. "
+            "Trying fallbacks."
         )
+        transcript_list = None
 
-    languages = []
-    for transcript in transcript_list:
-        languages.append({
-            "language_code": transcript.language_code,
-            "language": transcript.language,
-            "is_generated": transcript.is_generated,
-            "is_translatable": transcript.is_translatable,
-            "translation_languages": [
-                tl.language_code for tl in transcript.translation_languages
-            ] if transcript.is_translatable else [],
-        })
+    if transcript_list is not None:
+        languages = []
+        for transcript in transcript_list:
+            languages.append({
+                "language_code": transcript.language_code,
+                "language": transcript.language,
+                "is_generated": transcript.is_generated,
+                "is_translatable": transcript.is_translatable,
+                "translation_languages": [
+                    tl.language_code for tl in transcript.translation_languages
+                ] if transcript.is_translatable else [],
+            })
+        languages.sort(key=lambda x: (x["is_generated"], x["language_code"]))
+        return languages
 
-    # Sort: manually-created first, then alphabetical by language code
-    languages.sort(key=lambda x: (x["is_generated"], x["language_code"]))
-    return languages
+    # Strategy 2: Cloudflare Worker proxy (if configured)
+    worker_url = os.environ.get("YOUTUBE_PROXY_URL")
+    if worker_url:
+        logger.info(f"Trying Worker proxy for language list: {video_id}")
+        worker_langs = _list_languages_via_worker(video_id, worker_url)
+        if worker_langs is not None:
+            return worker_langs
+
+    # Strategy 3: Invidious instances
+    logger.info(f"Trying Invidious for language list: {video_id}")
+    invidious_langs = _list_languages_via_invidious(video_id)
+    if invidious_langs is not None:
+        return invidious_langs
+
+    # All methods failed
+    api_error_msg = f" youtube-transcript-api: {type(api_error).__name__}" if api_error else ""
+    raise RuntimeError(
+        f"Could not list languages for video {video_id}. "
+        f"All methods failed.{api_error_msg} "
+        "YouTube may be blocking requests from this server's IP address."
+    )
+
+
+def _list_languages_via_worker(video_id: str, proxy_url: str) -> Optional[list[dict]]:
+    """List available caption languages via the Cloudflare Worker proxy.
+
+    The worker proxies YouTube's timedtext API, which returns caption tracks
+    in srv1 XML format. We parse the track list from the response.
+    Returns None if the worker can't provide language info.
+    """
+    import xml.etree.ElementTree as ET
+
+    # Try requesting transcript without a specific language to get all tracks
+    params = {"v": video_id, "fmt": "srv1"}
+    try:
+        with httpx.Client(timeout=30, follow_redirects=True) as client:
+            response = client.get(proxy_url, params=params)
+            if response.status_code != 200:
+                logger.debug(f"Worker proxy language list: returned {response.status_code}")
+                return None
+
+            # Parse the XML to find all available tracks
+            try:
+                root = ET.fromstring(response.text)
+                # srv1 format: <transcript_list><track id="..." name="..." lang_code="en" .../>
+                tracks = root.findall(".//track") if root.tag == "transcript_list" else []
+                if not tracks:
+                    # If we got a single transcript (not a list), we know at least
+                    # one language exists but can't enumerate all. Return None to
+                    # let other fallbacks try, or return a minimal entry.
+                    logger.debug("Worker proxy: got single transcript, can't enumerate all languages")
+                    return None
+
+                languages = []
+                for track in tracks:
+                    lang_code = track.get("lang_code", "")
+                    lang_name = track.get("name", track.get("lang_translated", lang_code))
+                    kind = track.get("kind", "")
+                    is_auto = kind == "asr"
+                    languages.append({
+                        "language_code": lang_code,
+                        "language": lang_name,
+                        "is_generated": is_auto,
+                        "is_translatable": False,  # Can't determine from timedtext
+                        "translation_languages": [],
+                    })
+
+                if languages:
+                    logger.info(f"Worker proxy: found {len(languages)} languages for {video_id}")
+                    languages.sort(key=lambda x: (x["is_generated"], x["language_code"]))
+                    return languages
+            except ET.ParseError:
+                logger.debug("Worker proxy: response not valid XML for language listing")
+                return None
+
+    except Exception as e:
+        logger.debug(f"Worker proxy language list failed: {type(e).__name__}: {e}")
+        return None
+
+    return None
+
+
+def _list_languages_via_invidious(video_id: str) -> Optional[list[dict]]:
+    """List available caption languages via Invidious instances.
+
+    Returns None if all instances fail. Returns a list of language dicts
+    similar to the youtube-transcript-api format.
+    """
+    instances = _get_invidious_instances()
+
+    for instance in instances:
+        try:
+            captions_url = f"{instance}/api/v1/captions/{video_id}"
+            with httpx.Client(timeout=15, follow_redirects=True) as client:
+                response = client.get(captions_url)
+                if response.status_code != 200:
+                    logger.debug(f"Invidious {instance}: language list returned {response.status_code}")
+                    continue
+
+                data = response.json()
+                captions = data.get("captions", [])
+                if not captions:
+                    logger.debug(f"Invidious {instance}: no captions in list response")
+                    continue
+
+                languages = []
+                for cap in captions:
+                    lang_code = cap.get("languageCode", cap.get("language_code", ""))
+                    lang_name = cap.get("label", cap.get("name", lang_code))
+                    is_auto = _is_auto_caption(cap)
+                    languages.append({
+                        "language_code": lang_code,
+                        "language": lang_name,
+                        "is_generated": is_auto,
+                        "is_translatable": False,
+                        "translation_languages": [],
+                    })
+
+                if languages:
+                    logger.info(f"Invidious {instance}: found {len(languages)} languages for {video_id}")
+                    languages.sort(key=lambda x: (x["is_generated"], x["language_code"]))
+                    return languages
+
+        except httpx.TimeoutException:
+            logger.debug(f"Invidious {instance}: timed out during language listing")
+            continue
+        except Exception as e:
+            logger.debug(f"Invidious {instance}: language list failed: {type(e).__name__}: {e}")
+            continue
+
+    logger.warning(f"All Invidious instances failed for language listing: {video_id}")
+    return None
 
 
 def get_transcript(
