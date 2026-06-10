@@ -7,4 +7,12 @@ services:
     envVars:
       - key: NVIDIA_API_KEY
         sync: false
+      # Optional: Cloudflare Worker URL to proxy YouTube transcript requests.
+      # Deploy cloudflare-worker.js to Cloudflare Workers (free tier) and set the URL here.
+      - key: YOUTUBE_PROXY_URL
+        sync: false
+      # Optional: Custom Invidious instances (comma-separated).
+      # Built-in defaults work out of the box — only set this for custom instances.
+      - key: INVIDIOUS_INSTANCES
+        sync: false
     plan: free

@@ -98,8 +98,32 @@ videos-to-quiz/
 - **UPSC-style questions** — Statement-based, assertion-reason, analytical formats
 - **1-30 questions** — Batches API calls automatically for large quizzes
 - **Auto-detect captions** — Prefers manual captions, falls back to auto-generated
+- **Cloud deployment ready** — Invidious fallback bypasses YouTube's cloud IP blocking
 - **Interactive web UI** — Paste a URL, take the quiz, see your score
 - **Free LLM** — Uses NVIDIA NIM (Llama 3.3 70B), no paid API needed
+
+## Transcript Fallback Strategy
+
+YouTube blocks transcript requests from cloud/datacenter IPs (Render, Railway, AWS, etc.). The app handles this automatically with a multi-strategy fallback:
+
+| Priority | Method | Works on cloud IPs? | Setup required? |
+|----------|--------|---------------------|-----------------|
+| 1 | youtube-transcript-api | ❌ Blocked on cloud | None |
+| 2 | Cloudflare Worker proxy | ✅ CDN edge IPs | Deploy `cloudflare-worker.js` (free) |
+| 3 | Invidious instances | ✅ Public proxies | None — works out of the box |
+| 4 | yt-dlp | ⚠️ Sometimes | None |
+
+**For local development**, strategy #1 works fine — no configuration needed.
+
+**For Render/cloud deployments**, strategies #2 and #3 handle it automatically. Invidious (strategy #3) works out of the box with zero setup. For even more reliability, deploy `cloudflare-worker.js` to Cloudflare Workers (free tier: 100,000 requests/day) and set the `YOUTUBE_PROXY_URL` env var.
+
+### Deploying the Cloudflare Worker (optional but recommended)
+
+1. Create a free [Cloudflare account](https://dash.cloudflare.com/sign-up)
+2. Go to **Workers & Pages → Create Application → Create Worker**
+3. Paste the contents of `cloudflare-worker.js`
+4. Deploy — you'll get a URL like `https://youtube-transcript-proxy.YOUR-NAME.workers.dev`
+5. Set `YOUTUBE_PROXY_URL` on Render to that URL
 
 ## Roadmap
 

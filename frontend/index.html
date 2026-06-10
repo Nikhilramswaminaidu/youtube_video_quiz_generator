@@ -656,10 +656,32 @@
                 evtSource.addEventListener('error', (e) => {
                     evtSource.close();
 
-                    // If we already got some progress, it's a real failure
+                    // Server-sent error events have e.data with the error message
+                    let serverError = null;
+                    if (e.data) {
+                        try {
+                            const parsed = JSON.parse(e.data);
+                            serverError = parsed.error || parsed.message || e.data;
+                        } catch {
+                            serverError = e.data;
+                        }
+                    }
+
+                    if (serverError) {
+                        // Real error from the server — show the actual message
+                        btn.disabled = false;
+                        stopEtaCountdown();
+                        setProgress(0, 'Failed');
+                        showError(serverError);
+                        return;
+                    }
+
+                    // If we already got some progress but connection dropped, show generic error
                     if (streamSucceeded) {
                         btn.disabled = false;
-                        showError('Quiz generation failed. Please try again.');
+                        stopEtaCountdown();
+                        setProgress(0, 'Failed');
+                        showError('Quiz generation failed. The connection was lost — please try again.');
                         return;
                     }
 
