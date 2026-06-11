@@ -191,12 +191,11 @@ async def generate_quiz_stream(
                 current_batch = batch_num + 1
                 yield f"event: progress\ndata: {json.dumps({'step': 'generating', 'message': f'Generating questions (batch {current_batch}/{total_batches})...', 'batch': current_batch, 'total_batches': total_batches, 'done': len(all_questions), 'total': num_questions})}\n\n"
 
-                # Keepalive ping before long LLM call
-                yield f": keepalive\n\n"
-
-                batch_start = _time.time()
-                try:
-                    batch_quiz = await _generate_batch_async(
+                # Run batch in a background task so we can send keepalive
+                # pings during the call.  Render drops connections after ~30s
+                # of inactivity, and a single LLM call can take 30-120s.
+                batch_task = asyncio.create_task(
+                    _generate_batch_async(
                         transcript=result.text,
                         video_id=video_id,
                         num_questions=batch_count,
@@ -205,6 +204,19 @@ async def generate_quiz_stream(
                         batch_offset=batch_num * effective_batch,
                         transcript_section=sections[batch_num],
                     )
+                )
+
+                batch_start = _time.time()
+                try:
+                    # Send keepalive every 12s while the LLM call is running
+                    # to prevent Render/nginx proxies from closing the connection.
+                    while not batch_task.done():
+                        yield f": keepalive\n\n"
+                        done, _ = await asyncio.wait({batch_task}, timeout=12.0)
+                        if done:
+                            break
+
+                    batch_quiz = batch_task.result()
                     batch_elapsed = _time.time() - batch_start
                     batch_times.append(batch_elapsed)
                     if title is None:
@@ -212,13 +224,15 @@ async def generate_quiz_stream(
                     all_questions.extend(batch_quiz.questions)
 
                     # Calculate ETA based on average batch time
-                    done = len(all_questions)
+                    questions_done = len(all_questions)
                     remaining_batches = total_batches - (batch_num + 1)
                     avg_batch_time = sum(batch_times) / len(batch_times)
                     eta_seconds = round(remaining_batches * avg_batch_time)
 
-                    yield f"event: progress\ndata: {json.dumps({'step': 'batch_done', 'message': f'{done}/{num_questions} questions generated', 'done': done, 'total': num_questions, 'eta': eta_seconds, 'elapsed': round(_time.time() - gen_start, 1)})}\n\n"
+                    yield f"event: progress\ndata: {json.dumps({'step': 'batch_done', 'message': f'{questions_done}/{num_questions} questions generated', 'done': questions_done, 'total': num_questions, 'eta': eta_seconds, 'elapsed': round(_time.time() - gen_start, 1)})}\n\n"
                 except Exception as e:
+                    if not batch_task.done():
+                        batch_task.cancel()
                     yield f"event: error\ndata: {json.dumps({'error': f'Generation failed: {str(e)}'})}\n\n"
                     return
 
@@ -255,7 +269,15 @@ async def generate_quiz_stream(
             except Exception:
                 pass
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Prevent nginx/Render proxy buffering
+            "Connection": "keep-alive",
+        },
+    )
 
 
 def _build_quiz_response(video_id: str, quiz_data: dict) -> dict:

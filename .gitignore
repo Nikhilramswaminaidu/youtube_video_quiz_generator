@@ -16,6 +16,9 @@ env/
 # Quiz output
 quiz_*.json
 
+# Generated documentation
+project_documentation.pdf
+
 # IDE
 .vscode/
 .idea/
