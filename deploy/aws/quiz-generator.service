@@ -1,0 +1,37 @@
+[Unit]
+Description=YouTube Quiz Generator (gunicorn + uvicorn)
+After=network.target
+
+[Service]
+Type=notify
+User=quizapp
+Group=quizapp
+WorkingDirectory=/opt/youtube-quiz-generator
+Environment=PORT=8000
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/youtube-quiz-generator/.env
+
+# Gunicorn with uvicorn workers for async FastAPI
+# -w 2: 2 worker processes (fits t2.micro 1GB RAM)
+# -k uvicorn.workers.UvicornWorker: ASGI worker class
+# --timeout 300: matches nginx proxy_read_timeout for SSE
+# --bind 0.0.0.0:8000: listen on all interfaces
+ExecStart=/opt/youtube-quiz-generator/venv/bin/gunicorn \
+    backend.app.main:app \
+    -w 2 \
+    -k uvicorn.workers.UvicornWorker \
+    -b 0.0.0.0:8000 \
+    --timeout 300 \
+    --graceful-timeout 30 \
+    --access-logfile - \
+    --error-logfile -
+
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
