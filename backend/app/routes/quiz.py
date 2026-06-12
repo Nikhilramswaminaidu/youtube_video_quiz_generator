@@ -178,61 +178,83 @@ async def generate_quiz_stream(
             elapsed = round(_time.time() - gen_start, 1)
             yield f"event: progress\ndata: {json.dumps({'step': 'transcript_done', 'message': f'Transcript ready ({result.char_count:,} chars, {result.language})', 'elapsed': elapsed})}\n\n"
 
-            # Step 2: Generate quiz in sequential batches with progress
+            # Step 2: Generate quiz — single batch if fits, otherwise parallel batches
             effective_batch = _batch_size_for(num_questions, difficulty)
             total_batches = (num_questions + effective_batch - 1) // effective_batch
             sections = _split_transcript(result.text, total_batches)
             all_questions = []
             title = None
-            batch_times = []
 
-            for batch_num in range(total_batches):
-                batch_count = min(effective_batch, num_questions - batch_num * effective_batch)
-                current_batch = batch_num + 1
-                yield f"event: progress\ndata: {json.dumps({'step': 'generating', 'message': f'Generating questions (batch {current_batch}/{total_batches})...', 'batch': current_batch, 'total_batches': total_batches, 'done': len(all_questions), 'total': num_questions})}\n\n"
+            if total_batches == 1:
+                # Single batch — no need for parallel overhead
+                yield f"event: progress\ndata: {json.dumps({'step': 'generating', 'message': f'Generating {num_questions} questions...', 'batch': 1, 'total_batches': 1, 'done': 0, 'total': num_questions})}\n\n"
 
-                # Run batch in a background task so we can send keepalive
-                # pings during the call.  Render drops connections after ~30s
-                # of inactivity, and a single LLM call can take 30-120s.
                 batch_task = asyncio.create_task(
                     _generate_batch_async(
                         transcript=result.text,
                         video_id=video_id,
-                        num_questions=batch_count,
+                        num_questions=num_questions,
                         difficulty=difficulty,
                         transcript_language=result.language,
-                        batch_offset=batch_num * effective_batch,
-                        transcript_section=sections[batch_num],
+                        batch_offset=0,
                     )
                 )
-
-                batch_start = _time.time()
                 try:
-                    # Send keepalive every 12s while the LLM call is running
-                    # to prevent Render/nginx proxies from closing the connection.
                     while not batch_task.done():
                         yield f": keepalive\n\n"
                         done, _ = await asyncio.wait({batch_task}, timeout=12.0)
                         if done:
                             break
-
                     batch_quiz = batch_task.result()
-                    batch_elapsed = _time.time() - batch_start
-                    batch_times.append(batch_elapsed)
                     if title is None:
                         title = batch_quiz.title
                     all_questions.extend(batch_quiz.questions)
-
-                    # Calculate ETA based on average batch time
-                    questions_done = len(all_questions)
-                    remaining_batches = total_batches - (batch_num + 1)
-                    avg_batch_time = sum(batch_times) / len(batch_times)
-                    eta_seconds = round(remaining_batches * avg_batch_time)
-
-                    yield f"event: progress\ndata: {json.dumps({'step': 'batch_done', 'message': f'{questions_done}/{num_questions} questions generated', 'done': questions_done, 'total': num_questions, 'eta': eta_seconds, 'elapsed': round(_time.time() - gen_start, 1)})}\n\n"
+                    yield f"event: progress\ndata: {json.dumps({'step': 'batch_done', 'message': f'{len(all_questions)}/{num_questions} questions generated', 'done': len(all_questions), 'total': num_questions, 'elapsed': round(_time.time() - gen_start, 1)})}\n\n"
                 except Exception as e:
                     if not batch_task.done():
                         batch_task.cancel()
+                    yield f"event: error\ndata: {json.dumps({'error': f'Generation failed: {str(e)}'})}\n\n"
+                    return
+            else:
+                # Multiple batches — run in PARALLEL for speed
+                yield f"event: progress\ndata: {json.dumps({'step': 'generating', 'message': f'Generating questions in {total_batches} parallel batches...', 'batch': 0, 'total_batches': total_batches, 'done': 0, 'total': num_questions})}\n\n"
+
+                batch_tasks = {}
+                for batch_num in range(total_batches):
+                    batch_count = min(effective_batch, num_questions - batch_num * effective_batch)
+                    batch_tasks[batch_num] = asyncio.create_task(
+                        _generate_batch_async(
+                            transcript=result.text,
+                            video_id=video_id,
+                            num_questions=batch_count,
+                            difficulty=difficulty,
+                            transcript_language=result.language,
+                            batch_offset=batch_num * effective_batch,
+                            transcript_section=sections[batch_num],
+                        )
+                    )
+
+                # Wait for all batches with keepalive pings
+                pending = set(batch_tasks.values())
+                completed_count = 0
+                try:
+                    while pending:
+                        yield f": keepalive\n\n"
+                        done_set, pending = await asyncio.wait(pending, timeout=12.0)
+                        for task in done_set:
+                            try:
+                                batch_quiz = task.result()
+                                if title is None:
+                                    title = batch_quiz.title
+                                all_questions.extend(batch_quiz.questions)
+                                completed_count += 1
+                                yield f"event: progress\ndata: {json.dumps({'step': 'batch_done', 'message': f'{len(all_questions)}/{num_questions} questions generated', 'done': len(all_questions), 'total': num_questions, 'batch': completed_count, 'total_batches': total_batches, 'elapsed': round(_time.time() - gen_start, 1)})}\n\n"
+                            except Exception as e:
+                                completed_count += 1
+                                logger.warning(f"Parallel batch failed: {e}")
+                except Exception as e:
+                    for t in pending:
+                        t.cancel()
                     yield f"event: error\ndata: {json.dumps({'error': f'Generation failed: {str(e)}'})}\n\n"
                     return
 

@@ -28,7 +28,7 @@ FALLBACK_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
 # Rate limiting: max retries with exponential backoff
 MAX_RETRIES = 3
 INITIAL_BACKOFF_SECONDS = 2
-REQUEST_TIMEOUT = 120  # seconds — enough for 7-question batches
+REQUEST_TIMEOUT = 90  # seconds — reduced from 120 for faster fail/retry
 BATCH_SIZE = 7  # module-level constant (used by SSE import)
 MAX_TRANSCRIPT_CHARS = 4000  # truncate long transcripts to avoid token bloat
 
@@ -42,7 +42,7 @@ def _batch_size_for(num_questions: int, difficulty: str) -> int:
         return 5
     if difficulty == "hard" or num_questions > 20:
         return 7
-    return 10  # easy/moderate with <=20 questions — bigger batch, fewer calls
+    return 15  # easy/moderate with <=20 questions — bigger batch, fewer API calls
 
 
 # ─── API Key ─────────────────────────────────────────────────────────────────
