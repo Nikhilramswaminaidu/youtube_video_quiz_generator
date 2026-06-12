@@ -138,9 +138,13 @@ def _split_transcript(transcript: str, num_sections: int, overlap_chars: int = 2
 
 def _deduplicate_questions(
     questions: list[QuizQuestion],
-    similarity_threshold: float = 0.7,
+    similarity_threshold: float = 0.85,
 ) -> tuple[list[QuizQuestion], list[QuizQuestion]]:
-    """Remove similar questions. Returns (kept_questions, removed_questions).
+    """Remove near-identical questions. Returns (kept_questions, removed_questions).
+
+    0.85 threshold = only remove questions that are nearly identical wording.
+    Lower thresholds (0.7) are too aggressive and remove questions that test
+    different concepts but happen to share some phrasing.
 
     When duplicates are found, keeps the one with the longer explanation.
     """
@@ -383,13 +387,16 @@ async def generate_quiz(
             batch_offset=0,
         )
 
-    # Multiple batches — generate in groups, then dedup
-    total_batches = (num_questions + effective_batch - 1) // effective_batch
+    # Multiple batches — over-generate to account for dedup loss
+    # Generate ~25% extra questions so dedup doesn't leave us short
+    target_questions = num_questions
+    generate_total = min(num_questions + max(5, num_questions // 3), 40)
+    total_batches = (generate_total + effective_batch - 1) // effective_batch
     sections = _split_transcript(transcript, total_batches)
 
     all_questions: list[QuizQuestion] = []
     title = None
-    remaining = num_questions
+    remaining = generate_total
 
     for batch_num in range(total_batches):
         batch_count = min(effective_batch, remaining)
@@ -420,7 +427,7 @@ async def generate_quiz(
         logger.info(f"Dedup: removed {len(removed)} duplicate questions, {len(kept)} kept")
 
     # If dedup removed too many, generate supplemental batches to reach target
-    max_supplement_batches = 3
+    max_supplement_batches = 5
     supplement_batch = 0
     already_covered_topics = [q.question for q in kept]
 

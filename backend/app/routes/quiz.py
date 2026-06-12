@@ -178,9 +178,12 @@ async def generate_quiz_stream(
             elapsed = round(_time.time() - gen_start, 1)
             yield f"event: progress\ndata: {json.dumps({'step': 'transcript_done', 'message': f'Transcript ready ({result.char_count:,} chars, {result.language})', 'elapsed': elapsed})}\n\n"
 
-            # Step 2: Generate quiz — single batch if fits, otherwise parallel batches
+            # Step 2: Generate quiz — over-generate to compensate for dedup loss
             effective_batch = _batch_size_for(num_questions, difficulty)
-            total_batches = (num_questions + effective_batch - 1) // effective_batch
+
+            # Over-generate: add ~30% extra so dedup doesn't leave us short
+            generate_total = min(num_questions + max(5, num_questions // 3), 40)
+            total_batches = (generate_total + effective_batch - 1) // effective_batch
             sections = _split_transcript(result.text, total_batches)
             all_questions = []
             title = None
@@ -193,7 +196,7 @@ async def generate_quiz_stream(
                     _generate_batch_async(
                         transcript=result.text,
                         video_id=video_id,
-                        num_questions=num_questions,
+                        num_questions=generate_total,
                         difficulty=difficulty,
                         transcript_language=result.language,
                         batch_offset=0,
@@ -221,7 +224,7 @@ async def generate_quiz_stream(
 
                 batch_tasks = {}
                 for batch_num in range(total_batches):
-                    batch_count = min(effective_batch, num_questions - batch_num * effective_batch)
+                    batch_count = min(effective_batch, generate_total - batch_num * effective_batch)
                     batch_tasks[batch_num] = asyncio.create_task(
                         _generate_batch_async(
                             transcript=result.text,
@@ -267,7 +270,7 @@ async def generate_quiz_stream(
                 logger.info(f"Dedup removed {len(removed)} duplicates, {len(kept)} kept")
 
             # Step 3b: If dedup removed too many, generate supplemental batches to reach target
-            max_supplement_batches = 3
+            max_supplement_batches = 5
             supplement_batch = 0
             already_covered_topics = [q.question for q in kept]
 
