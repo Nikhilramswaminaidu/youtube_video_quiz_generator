@@ -269,3 +269,7 @@ Internet → nginx (port 80) → gunicorn (port 8000) → FastAPI app
 - **gunicorn** manages 2 uvicorn worker processes for the ASGI app
 - **Cloudflare Worker** proxies YouTube transcript requests (stays on Cloudflare)
 - **NVIDIA NIM** provides LLM inference for quiz generation
+
+
+
+ http://51.21.128.178/
