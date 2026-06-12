@@ -63,16 +63,40 @@ apt-get install -y -qq \
 ok "System packages installed."
 
 # ---------------------------------------------------------------------------
-# Step 2: Python 3.11+
+# Step 2: Python 3.10+
 # ---------------------------------------------------------------------------
-log "Step 2/8: Installing Python 3.11..."
-if ! command -v python3.11 &>/dev/null; then
+# Auto-detect the best available Python version.
+# Ubuntu 22.04 has python3.10, Ubuntu 24.04 has python3.12,
+# Ubuntu 26.04 has python3.14. We prefer the system Python if >= 3.10.
+log "Step 2/8: Installing Python..."
+PYTHON_BIN=""
+PYTHON_VER=""
+
+# Check system python3 first
+SYS_PYTHON_VER=$(python3 -c 'import sys; print(sys.version_info.major*100 + sys.version_info.minor)' 2>/dev/null || echo "0")
+if [ "$SYS_PYTHON_VER" -ge 310 ]; then
+    PYTHON_BIN="python3"
+    PYTHON_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    log "Using system Python: $PYTHON_VER"
+fi
+
+# If system python is too old, try deadsnakes PPA for 3.11
+if [ -z "$PYTHON_BIN" ]; then
+    log "System Python is too old, installing Python 3.11 from deadsnakes PPA..."
     add-apt-repository -y ppa:deadsnakes/ppa
     apt-get update -y -qq
     apt-get install -y -qq python3.11 python3.11-venv python3.11-dev python3-pip
+    PYTHON_BIN="python3.11"
+    PYTHON_VER="3.11"
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 fi
-ok "Python $(python3 --version) ready."
+
+# Install venv support if using system python
+if [ "$PYTHON_BIN" = "python3" ] && ! python3 -m venv --help &>/dev/null; then
+    apt-get install -y -qq python3-venv python3-dev python3-pip
+fi
+
+ok "Python $($PYTHON_BIN --version) ready."
 
 # ---------------------------------------------------------------------------
 # Step 3: Swap file
@@ -121,7 +145,7 @@ log "Step 6/8: Installing Python dependencies..."
 cd "$APP_DIR"
 
 if [ ! -d "venv" ]; then
-    sudo -u "$APP_USER" python3.11 -m venv venv
+    sudo -u "$APP_USER" $PYTHON_BIN -m venv venv
     ok "Virtual environment created."
 fi
 

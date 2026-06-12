@@ -7,7 +7,7 @@
 # and starts the service on port 80.
 #
 # Prerequisites:
-#   - Ubuntu 22.04 or 24.04 AMI
+#   - Ubuntu 22.04, 24.04, or 26.04 AMI
 #   - t2.micro or t3.micro instance (free tier eligible)
 #   - Security group allowing: SSH (22), HTTP (80), HTTPS (443)
 #   - Paste this entire script into the "User data" field when launching
@@ -59,14 +59,40 @@ apt-get install -y \
 log "System packages installed."
 
 # ---------------------------------------------------------------------------
-# Step 2: Python 3.11+
+# Step 2: Python 3.10+
 # ---------------------------------------------------------------------------
-log "Installing Python 3.11..."
-add-apt-repository -y ppa:deadsnakes/ppa
-apt-get update -y
-apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip
-update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
-log "Python 3.11 installed: $(python3 --version)"
+# Auto-detect the best available Python version.
+# Ubuntu 22.04 has python3.10, Ubuntu 24.04 has python3.12,
+# Ubuntu 26.04 has python3.14. We prefer the system Python if >= 3.10.
+log "Installing Python..."
+PYTHON_BIN=""
+PYTHON_VER=""
+
+# Check system python3 first
+SYS_PYTHON_VER=$(python3 -c 'import sys; print(sys.version_info.major*100 + sys.version_info.minor)' 2>/dev/null || echo "0")
+if [ "$SYS_PYTHON_VER" -ge 310 ]; then
+    PYTHON_BIN="python3"
+    PYTHON_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    log "Using system Python: $PYTHON_VER"
+fi
+
+# If system python is too old, try deadsnakes PPA for 3.11
+if [ -z "$PYTHON_BIN" ]; then
+    log "System Python is too old, installing Python 3.11 from deadsnakes PPA..."
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update -y
+    apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip
+    PYTHON_BIN="python3.11"
+    PYTHON_VER="3.11"
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+fi
+
+# Install venv support if using system python
+if [ "$PYTHON_BIN" = "python3" ] && ! python3 -m venv --help &>/dev/null; then
+    apt-get install -y python3-venv python3-dev python3-pip
+fi
+
+log "Python ready: $($PYTHON_BIN --version)"
 
 # ---------------------------------------------------------------------------
 # Step 3: Swap file (1 GB RAM on t2.micro is tight)
@@ -115,7 +141,7 @@ log "Setting up Python virtual environment..."
 cd "$APP_DIR"
 
 if [ ! -d "venv" ]; then
-    sudo -u "$APP_USER" python3.11 -m venv venv
+    sudo -u "$APP_USER" $PYTHON_BIN -m venv venv
     log "Virtual environment created."
 fi
 
