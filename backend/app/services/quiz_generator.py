@@ -419,6 +419,45 @@ async def generate_quiz(
     if removed:
         logger.info(f"Dedup: removed {len(removed)} duplicate questions, {len(kept)} kept")
 
+    # If dedup removed too many, generate supplemental batches to reach target
+    max_supplement_batches = 3
+    supplement_batch = 0
+    already_covered_topics = [q.question for q in kept]
+
+    while len(kept) < num_questions and supplement_batch < max_supplement_batches:
+        shortfall = num_questions - len(kept)
+        supplement_count = min(shortfall + 2, effective_batch)  # +2 buffer for potential dups
+        supplement_batch += 1
+        logger.info(f"Supplement batch {supplement_batch}: generating {supplement_count} more (shortfall={shortfall})")
+
+        try:
+            sup_quiz = await asyncio.to_thread(
+                _generate_batch,
+                transcript=transcript,
+                video_id=video_id,
+                num_questions=supplement_count,
+                difficulty=difficulty,
+                transcript_language=transcript_language,
+                model=model,
+                batch_offset=len(kept),
+                exclude_topics=already_covered_topics,
+            )
+
+            if title is None:
+                title = sup_quiz.title
+
+            kept.extend(sup_quiz.questions)
+            already_covered_topics.extend(q.question for q in sup_quiz.questions)
+
+            # Re-dedup the combined set
+            kept, sup_removed = _deduplicate_questions(kept)
+            if sup_removed:
+                logger.info(f"Supplement dedup: removed {len(sup_removed)}, {len(kept)} kept")
+
+        except Exception as e:
+            logger.warning(f"Supplement batch failed: {e}")
+            break
+
     return Quiz(
         title=title or f"Quiz: Video {video_id}",
         video_id=video_id,

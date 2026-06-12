@@ -244,6 +244,55 @@ async def generate_quiz_stream(
             if removed:
                 logger.info(f"Dedup removed {len(removed)} duplicates, {len(kept)} kept")
 
+            # Step 3b: If dedup removed too many, generate supplemental batches to reach target
+            max_supplement_batches = 3
+            supplement_batch = 0
+            already_covered_topics = [q.question for q in kept]
+
+            while len(kept) < num_questions and supplement_batch < max_supplement_batches:
+                shortfall = num_questions - len(kept)
+                supplement_count = min(shortfall + 2, effective_batch)  # +2 buffer for potential dups
+                supplement_batch += 1
+                logger.info(f"Supplement batch {supplement_batch}: generating {supplement_count} more (shortfall={shortfall})")
+
+                yield f"event: progress\ndata: {json.dumps({'step': 'generating', 'message': f'Generating more questions to reach target ({len(kept)}/{num_questions})...', 'batch': total_batches + supplement_batch, 'total_batches': total_batches, 'done': len(kept), 'total': num_questions, 'elapsed': round(_time.time() - gen_start, 1)})}\n\n"
+
+                sup_task = asyncio.create_task(
+                    _generate_batch_async(
+                        transcript=result.text,
+                        video_id=video_id,
+                        num_questions=supplement_count,
+                        difficulty=difficulty,
+                        transcript_language=result.language,
+                        batch_offset=len(kept),
+                        exclude_topics=already_covered_topics,
+                    )
+                )
+
+                sup_start = _time.time()
+                try:
+                    while not sup_task.done():
+                        yield f": keepalive\n\n"
+                        done, _ = await asyncio.wait({sup_task}, timeout=12.0)
+                        if done:
+                            break
+
+                    sup_quiz = sup_task.result()
+                    if title is None:
+                        title = sup_quiz.title
+
+                    kept.extend(sup_quiz.questions)
+                    already_covered_topics.extend(q.question for q in sup_quiz.questions)
+
+                    # Re-dedup the combined set
+                    kept, removed = _deduplicate_questions(kept)
+                    if removed:
+                        logger.info(f"Supplement dedup: removed {len(removed)}, {len(kept)} kept")
+
+                except Exception as e:
+                    logger.warning(f"Supplement batch failed: {e}")
+                    break
+
             yield f"event: progress\ndata: {json.dumps({'step': 'dedup_done', 'message': f'{len(kept)} unique questions ready', 'done': len(kept), 'total': num_questions, 'elapsed': round(_time.time() - gen_start, 1)})}\n\n"
 
             # Build final quiz
