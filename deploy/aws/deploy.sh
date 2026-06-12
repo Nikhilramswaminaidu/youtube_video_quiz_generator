@@ -91,9 +91,18 @@ if [ -z "$PYTHON_BIN" ]; then
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 fi
 
-# Install venv support if using system python
-if [ "$PYTHON_BIN" = "python3" ] && ! python3 -m venv --help &>/dev/null; then
-    apt-get install -y -qq python3-venv python3-dev python3-pip
+# Install venv support — on Ubuntu, python3-venv isn't always included
+# On Ubuntu 26.04 we need the version-specific package (e.g. python3.14-venv)
+# Install the venv package separately to avoid conflicts with generic python3-dev/pip
+if [ "$PYTHON_BIN" = "python3" ]; then
+    VENV_PKG="python${PYTHON_VER}-venv"
+    DEV_PKG="python${PYTHON_VER}-dev"
+    if ! dpkg -s "$VENV_PKG" &>/dev/null 2>&1; then
+        apt-get install -y -qq "$VENV_PKG"
+    fi
+    if ! dpkg -s "$DEV_PKG" &>/dev/null 2>&1; then
+        apt-get install -y -qq "$DEV_PKG" || true
+    fi
 fi
 
 ok "Python $($PYTHON_BIN --version) ready."
@@ -128,6 +137,10 @@ fi
 # Step 5: Clone / update repository
 # ---------------------------------------------------------------------------
 log "Step 5/8: Setting up application code..."
+# Mark repo directory as safe for ALL users (avoids "dubious ownership" errors
+# when root runs git in a quizapp-owned directory after chown)
+git config --system --add safe.directory "$APP_DIR"
+
 if [ ! -d "${APP_DIR}/.git" ]; then
     git clone -b "$BRANCH" "$REPO_URL" "$APP_DIR"
     ok "Repository cloned to ${APP_DIR}."
@@ -143,6 +156,12 @@ chown -R "${APP_USER}:${APP_GROUP}" "$APP_DIR"
 # ---------------------------------------------------------------------------
 log "Step 6/8: Installing Python dependencies..."
 cd "$APP_DIR"
+
+# Remove broken venv from a previous failed run (e.g. missing ensurepip)
+if [ -d "venv" ] && [ ! -x "venv/bin/pip" ]; then
+    warn "Removing broken venv from previous run..."
+    rm -rf venv
+fi
 
 if [ ! -d "venv" ]; then
     sudo -u "$APP_USER" $PYTHON_BIN -m venv venv
